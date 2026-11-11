@@ -708,12 +708,11 @@ fn test_an_update_of_ctrl_reg2_never_writes_a_self_clearing_bit() [io]
     log_clear(c)
     test.assert(lps22hb.autoinc_set(d, false))
     let l = log_list(c)
-    var wrote = -1
-    var i = 0
-    while i < l.len()
-        if l[i] == 1 and l[i + 1] == 0x11
-            wrote = l[i + 2]
-        i = i + 3
+    // The log holds (kind, register, value) triples; the last write to
+    // register 0x11 is the one that counts.
+    let wrote = list.fold(list.range(0, l.len() / 3),
+        (last, k) => (if l[3 * k] == 1 and l[3 * k + 1] == 0x11 then l[3 * k + 2] else last),
+        -1)
     test.assert_eq(wrote, 0)
 
 @test
