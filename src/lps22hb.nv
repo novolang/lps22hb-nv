@@ -1,0 +1,1334 @@
+// lps22hb — ST's LPS22HB and LPS22HH absolute pressure sensors, on their
+// I2C or their SPI bus, as devices-nv's `Barometer`, `Thermometer` and
+// `Identifiable`.
+//
+// Both parts are 260 to 1260 hPa piezoresistive sensors with a 24-bit
+// pressure and a 16-bit temperature output, a FIFO, a data-ready line and
+// a pressure-threshold interrupt.  The LPS22HH is the LPS22HB's
+// successor: its configuration registers keep most of the LPS22HB's
+// places and bits, and the differences are named at their sites.  The
+// facts below are from ST's LPS22HB datasheet, "DocID027083 Rev 5",
+// November 2016 (the document ST's site now numbers DS10829), whose
+// sections, tables and registers are named here; the LPS22HH facts are
+// from ST's register header `lps22hh_reg.h` (STMems_Standard_C_drivers,
+// the `lps22hh-pid` repository) and from Zephyr's `lps22hh` driver,
+// because the LPS22HH datasheet itself (DS12754 in the brief of this
+// package) could not be fetched.  Every LPS22HH figure the header and the
+// driver do not give is marked "not read" at its site.
+//
+// The two parts, side by side (HB / HH):
+//
+//   WHO_AM_I (0x0F)       0xB1 / 0xB3, the family switch of this driver
+//   I2C address           0x5C (SA0 low) or 0x5D (SA0 high), both
+//   pressure              24 bits, two's complement, 4096 LSB per hPa, both
+//   temperature           16 bits, two's complement, 100 LSB per degC, both
+//   output data rate      1, 10, 25, 50, 75 Hz / and 100, 200 Hz
+//   FIFO                  32 samples / 128 samples
+//   FIFO_CTRL             0x14: mode in bits 7:5, watermark in 4:0 /
+//                         0x13: mode in 2:0, stop-on-watermark in bit 3,
+//                         with the watermark in FIFO_WTM, 0x14
+//   FIFO data             the output registers, 0x28 / FIFO_DATA_OUT, 0x78
+//   REF_P                 3 bytes at 0x15 / 2 bytes at 0x15
+//   INT_SOURCE            0x25 / 0x24
+//   FIFO_STATUS           0x26 / FIFO_STATUS1 (the count) at 0x25 and
+//                         FIFO_STATUS2 (the flags) at 0x26
+//   low-current mode      RES_CONF.LC_EN (0x1A), power-down only /
+//                         CTRL_REG2.LOW_NOISE_EN, the opposite sense
+//   interrupt pad level   CTRL_REG3 bits 7 and 6 / CTRL_REG2 bits 6 and 5
+//
+// The registers and bits both parts share, as this driver uses them:
+//
+//   0x0B  INTERRUPT_CFG   PHE 0, PLE 1, LIR 2, DIFF_EN 3, RESET_AZ 4,
+//                         AUTOZERO 5, RESET_ARP 6, AUTORIFP 7
+//   0x0C  THS_P_L, 0x0D THS_P_H     the threshold, 1/16 hPa per step
+//   0x10  CTRL_REG1       SIM 0, BDU 1, LPFP_CFG 2, EN_LPFP 3, ODR 6:4
+//   0x11  CTRL_REG2       ONE_SHOT 0, SWRESET 2, IF_ADD_INC 4, BOOT 7
+//   0x12  CTRL_REG3       INT_S 1:0, DRDY 2, F_OVR 3, F_FTH 4, F_FSS5 5
+//   0x18  RPDS_L, 0x19 RPDS_H       the one-point-calibration offset
+//   0x27  STATUS          P_DA 0, T_DA 1, P_OR 4, T_OR 5
+//   0x28  PRESS_OUT_XL, 0x29, 0x2A (high); 0x2B TEMP_OUT_L, 0x2C (high)
+//
+// STATUS has the same bit places in both parts.  Zephyr's `lps22hb.h`
+// writes P_DA as bit 1 and T_DA as bit 0 and P_OR as bit 5 and T_OR as
+// bit 4, the opposite of the datasheet's Table at 9.17 and of ST's own
+// `lps22hb_reg.h`; Zephyr never reads the flags, so the error shows
+// nowhere, and a driver written from that header would swap them.
+//
+// The two buses.  On I2C the part answers at 0x5C or 0x5D and the
+// register address advances after each byte (IF_ADD_INC, set at reset).
+// On SPI a transaction is a control byte, bit 7 the read flag and bits
+// 6:0 the register, then data bytes inside one chip-select window; the
+// address advances after each byte, and there is no dummy byte (unlike
+// Bosch's BMP390).  The SPI mode is 3, as Zephyr's `lps22hh` driver sets
+// it, and the datasheet's Table 6 allows 10 MHz.
+//
+// Reading the data.  `begin` sets BDU, so a result is held until its
+// high byte is read: pressure until PRESS_OUT_H (0x2A), temperature until
+// TEMP_OUT_H (0x2C).  The pressure is read as one burst of 3 bytes that
+// ends at 0x2A and the temperature as one burst of 2 bytes that ends at
+// 0x2C, so each result is whole.  The datasheet's note 2 to CTRL_REG1 asks
+// for IF_ADD_INC = 0 and single-byte reads on I2C when BDU is set; ST's
+// own C driver and Zephyr read the bursts with both set, and this
+// driver does too.  NOT VERIFIED against a part.
+//
+// The one-shot form.  With ODR = 0 the part is powered down, and writing
+// ONE_SHOT starts one conversion of pressure and temperature; the bit
+// clears itself when the results are in the output registers.  Neither
+// datasheet nor header gives the time.  Zephyr's `lps22hh` waits up to
+// 10 ms in 1 ms steps and its comment measures "sub 3 ms" on one LPS22HH;
+// the LPS22HB runs at 75 Hz at most, so a conversion is no longer than
+// 13.4 ms.  `conversion_us` answers 14000 for the LPS22HB and 6000 for the
+// LPS22HH as a bound, and completion is read from ONE_SHOT.
+//
+// Drivers read for their fixes, nothing ported: Zephyr's `lps22hb` and
+// `lps22hh` drivers, the `lps22hb` crate (nebelgrau77/lps22hb-rs) and the
+// `lps22hh-rs` crate (STMicroelectronics/lps22hh-rs, not opened beyond
+// its register header).  Each fix kept is named at its site.
+
+use core.rt
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_baro.{ Pascals, Barometer, BarometerAsync }
+use dev_thermo.{ TempMilliC, Thermometer, ThermometerAsync }
+use dev_id.{ DeviceId, Identifiable }
+
+// A part whose WHO_AM_I has not been read yet: every function that needs
+// the register map refuses.
+pub const FAM_NONE = 0
+
+// The LPS22HB's register map.
+pub const FAM_HB = 1
+
+// The LPS22HH's register map.
+pub const FAM_HH = 2
+
+// WHO_AM_I's two values.
+let ID_HB = 0xB1
+let ID_HH = 0xB3
+
+// The registers both parts have.
+let INTERRUPT_CFG = 0x0B
+let THS_P_L       = 0x0C
+let IF_CTRL       = 0x0E
+let WHO_AM_I      = 0x0F
+let CTRL_REG1     = 0x10
+let CTRL_REG2     = 0x11
+let CTRL_REG3     = 0x12
+let RPDS_L        = 0x18
+let RES_CONF      = 0x1A
+let STATUS        = 0x27
+let PRESS_OUT_XL  = 0x28
+let TEMP_OUT_L    = 0x2B
+let LPFP_RES      = 0x33
+let FIFO_OUT_HH   = 0x78
+
+// INTERRUPT_CFG's bits.
+let ICFG_PHE       = 0x01
+let ICFG_PLE       = 0x02
+let ICFG_LIR       = 0x04
+let ICFG_DIFF_EN   = 0x08
+let ICFG_RESET_AZ  = 0x10
+let ICFG_AUTOZERO  = 0x20
+let ICFG_RESET_ARP = 0x40
+let ICFG_AUTORIFP  = 0x80
+
+// CTRL_REG1's bits.
+let CR1_ODR_MASK = 0x70
+let CR1_EN_LPFP  = 0x08
+let CR1_LPFP_CFG = 0x04
+let CR1_BDU      = 0x02
+
+// CTRL_REG2's bits, and the three that clear themselves.
+let CR2_BOOT         = 0x80
+let CR2_IF_ADD_INC   = 0x10
+let CR2_SWRESET      = 0x04
+let CR2_ONE_SHOT     = 0x01
+let CR2_SELF_CLEAR   = 0x85
+let CR2_HB_FIFO_EN   = 0x40
+let CR2_HB_STOP_FTH  = 0x20
+let CR2_HH_INT_H_L   = 0x40
+let CR2_HH_PP_OD     = 0x20
+let CR2_HH_LOW_NOISE = 0x02
+
+// CTRL_REG3's bits.
+let CR3_INT_S      = 0x03
+let CR3_DRDY       = 0x04
+let CR3_F_OVR      = 0x08
+let CR3_F_FTH      = 0x10
+let CR3_F_FULL     = 0x20
+let CR3_HB_PP_OD   = 0x40
+let CR3_HB_INT_H_L = 0x80
+
+// RES_CONF's low-current bit, on the LPS22HB.
+let RES_LC_EN = 0x01
+
+// STATUS' bits.
+let ST_P_DA = 0x01
+let ST_T_DA = 0x02
+
+// INT_SOURCE's boot bit.
+let INT_BOOT = 0x80
+
+// The SPI control byte's read flag.
+let SPI_READ = 0x80
+
+// The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
+let SPI_MODE = 3
+
+// The most polls of a self-clearing bit that `reset`, `reboot` and
+// `sample_oneshot` make.
+let POLLS = 2000
+
+// The largest output data rate code of each part (CTRL_REG1 Table 17, and
+// the header's `lps22hh_odr_t`).
+let ODR_MAX_HB = 5
+let ODR_MAX_HH = 7
+
+// The most samples one `fifo_take` moves.
+pub alias Lps22Samples = Vec[Int; 32]
+
+// The FIFO modes, named as a program means them.  `fifo_set` maps each to
+// the code of the part's own table (HB Table 20, HH `lps22hh_f_mode_t`);
+// the two parts number the same modes differently.  Bypass: the FIFO is
+// off and empty.
+pub const FIFO_BYPASS = 0
+
+// FIFO mode: it fills and stops when full.
+pub const FIFO_FIFO = 1
+
+// Stream mode: it fills and overwrites the oldest sample.
+pub const FIFO_STREAM = 2
+
+// Dynamic-stream mode: after the FIFO is emptied the first new sample is
+// the first read.
+pub const FIFO_DYNAMIC = 3
+
+// Stream-to-FIFO mode: stream until the interrupt is active, then FIFO.
+pub const FIFO_STREAM_TO_FIFO = 4
+
+// Bypass-to-stream mode: empty until the interrupt is active, then stream.
+pub const FIFO_BYPASS_TO_STREAM = 5
+
+// Bypass-to-FIFO mode: empty until the interrupt is active, then FIFO.
+pub const FIFO_BYPASS_TO_FIFO = 6
+
+// One reading: the pressure in millipascals and the temperature in
+// millidegrees Celsius.
+pub @value
+struct Lps22Sample
+    milli_pa: Int
+    milli_c: Int
+
+// A bus the part is on.  `setup` makes the bus and the pins ready and
+// answers whether the wiring suits the bus; `read_regs` reads `n`
+// registers from `reg` in one transaction; `write_reg` writes one
+// register; `irq_level` answers the level of the INT_DRDY pin; `family`
+// answers the register map the port was told to use, `FAM_HB`, `FAM_HH`
+// or `FAM_NONE`.
+pub trait Lps22Port
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+    fn irq_level(self) -> Int [hw]
+    fn family(self) -> Int
+
+// ── The two buses ────────────────────────────────────────────────────
+
+// Reads `n` registers from `reg` into `dst` in one I2C transaction, a
+// write of the register and a repeated start: whether the part answered.
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// Writes `v` to the register `reg` in one I2C transaction: whether the
+// part acknowledged.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Reads `n` registers from `reg` into `dst` in one SPI transaction: the
+// control byte with the read flag, then `n` bytes, with no dummy byte.
+// Whether it ran, which is whether the wiring has a chip select.
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((SPI_READ | (reg & 0x7F)) as u8)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
+
+// Writes `v` to the register `reg` in one SPI transaction, read flag
+// clear: whether it ran.  The part answers nothing to a write.
+pub fn spi_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
+                                        v: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg & 0x7F) as u8)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var none)
+
+// Makes an I2C bus ready: the INT_DRDY pin an input, the bus at 400 kHz.
+// Answers whether the wiring has an address.
+pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// Makes an SPI bus ready: chip select driven high first, so the pin
+// never drives low before the bus is ready, then an output; the
+// INT_DRDY pin an input; the bus at 4 MHz in mode 3.  Answers whether the
+// wiring has a chip select.
+pub fn spi_setup<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    gpio.set(cs, 1)
+    gpio.mode(cs, 1)
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(SPI_HZ, SPI_MODE)
+    true
+
+// The level of the part's INT_DRDY line on the board, 1 or 0, or -1 for a
+// wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// ── Where each part keeps a register ─────────────────────────────────
+
+// FIFO_CTRL: 0x14 on the LPS22HB, 0x13 on the LPS22HH.
+fn r_fifo_ctrl(fam: Int) -> Int
+    if fam == FAM_HH
+        return 0x13
+    0x14
+
+// INT_SOURCE: 0x25 on the LPS22HB, 0x24 on the LPS22HH.
+fn r_int_source(fam: Int) -> Int
+    if fam == FAM_HH
+        return 0x24
+    0x25
+
+// The register whose value is the number of samples in the FIFO: the
+// LPS22HB's FIFO_STATUS, 0x26, in its low 6 bits, and the LPS22HH's
+// FIFO_STATUS1, 0x25, whole.
+fn r_fifo_count(fam: Int) -> Int
+    if fam == FAM_HH
+        return 0x25
+    0x26
+
+// The depth of the FIFO: 32 samples on the LPS22HB.  The LPS22HH's
+// FIFO_STATUS1 is 8 bits and ST's header gives 128 as the depth; not read
+// from the datasheet.
+pub fn fifo_depth(fam: Int) -> Int
+    if fam == FAM_HH
+        return 128
+    32
+
+// The largest ODR code the part has.
+pub fn odr_max(fam: Int) -> Int
+    if fam == FAM_HH
+        return ODR_MAX_HH
+    ODR_MAX_HB
+
+// The time to wait for a one-shot conversion, in microseconds: a bound,
+// not a figure from a data sheet (see the head of the file).
+pub fn conversion_us(fam: Int) -> Int
+    if fam == FAM_HH
+        return 6000
+    14000
+
+// The FIFO mode code of the part's own table for a mode of this
+// package, or -1 for a mode the part does not have.  LPS22HB, Table 20:
+// bypass 0, FIFO 1, stream 2, stream-to-FIFO 3, bypass-to-stream 4,
+// dynamic-stream 6, bypass-to-FIFO 7 (5 is reserved).  LPS22HH,
+// `lps22hh_f_mode_t`: bypass 0, FIFO 1, stream 2, dynamic-stream 3,
+// bypass-to-FIFO 5, bypass-to-stream 6, stream-to-FIFO 7.
+pub fn fifo_code(fam: Int, mode: Int) -> Int
+    if mode == FIFO_BYPASS
+        return 0
+    if mode == FIFO_FIFO
+        return 1
+    if mode == FIFO_STREAM
+        return 2
+    if fam == FAM_HH
+        if mode == FIFO_DYNAMIC
+            return 3
+        if mode == FIFO_BYPASS_TO_FIFO
+            return 5
+        if mode == FIFO_BYPASS_TO_STREAM
+            return 6
+        if mode == FIFO_STREAM_TO_FIFO
+            return 7
+        return -1
+    if mode == FIFO_STREAM_TO_FIFO
+        return 3
+    if mode == FIFO_BYPASS_TO_STREAM
+        return 4
+    if mode == FIFO_DYNAMIC
+        return 6
+    if mode == FIFO_BYPASS_TO_FIFO
+        return 7
+    -1
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+// `n` divided by `d` rounded to the nearest whole number, halves away
+// from zero; `d` is positive.
+fn round_div(n: Int, d: Int) -> Int
+    if n < 0
+        return 0 - ((0 - n) * 2 + d) / (d * 2)
+    (n * 2 + d) / (d * 2)
+
+// The pressure in millipascals for a 24-bit count: 4096 counts a
+// hectopascal, so a count is 100000 / 4096 = 3125 / 128 millipascals.
+// The count is two's complement; `raw` may hold more than 24 bits and the
+// rest is dropped.  The answer is rounded to the nearest.
+//
+// ```novo
+// use lps22hb
+//
+// fn main() [io]
+//     // 1013.25 hPa is 4150272 counts: 1013.25 x 4096.
+//     println("${lps22hb.pressure_mpa(4150272)}")   // 101325000
+//     println("${lps22hb.pressure_mpa(-4096)}")     // -100000
+// ```
+pub fn pressure_mpa(raw: Int) -> Int
+    round_div(dev_bus.dev_sign_extend(raw, 24) * 3125, 128)
+
+// The pressure in whole pascals for a 24-bit count, to the nearest.
+pub fn pressure_pa(raw: Int) -> Int
+    round_div(dev_bus.dev_sign_extend(raw, 24) * 25, 1024)
+
+// The temperature in millidegrees Celsius for a 16-bit count: 100 counts
+// a degree, so a count is 10 millidegrees.
+//
+// ```novo
+// use lps22hb
+//
+// fn main() [io]
+//     println("${lps22hb.temp_milli_c(2500)}")     // 25000
+//     println("${lps22hb.temp_milli_c(0xF830)}")   // -20000
+// ```
+pub fn temp_milli_c(raw: Int) -> Int
+    dev_bus.dev_sign_extend(raw, 16) * 10
+
+// The threshold register's value for a pressure in pascals: 1/16 hPa a
+// step, 6.25 Pa, rounded to the nearest and held to the register's
+// 16 bits (15 on the LPS22HH).
+pub fn threshold_code(pa: Int, fam: Int) -> Int
+    var c = round_div(pa * 4, 25)
+    var top = 0xFFFF
+    if fam == FAM_HH
+        top = 0x7FFF
+    if c > top
+        c = top
+    if c < 0
+        c = 0
+    c
+
+// The pressure in pascals a threshold register's value means.
+pub fn threshold_pa(code: Int) -> Int
+    round_div(code * 25, 4)
+
+// ── Register access ──────────────────────────────────────────────────
+
+// One register, or `None` when the part did not answer.
+pub fn reg_read<P: Lps22Port>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes `v` to the register `reg` and reads it back: whether the part
+// holds the value.  Not for a register with a bit that clears itself.
+pub fn reg_write<P: Lps22Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    if not p.write_reg(reg, v)
+        return false
+    reg_read(p, reg) == Some(v & 0xFF)
+
+// Reads `reg`, clears the bits of `mask`, sets `fl` (a subset of
+// `mask`), writes it back and reads it again: whether the part holds the
+// bits.  Fix kept: the lps22hb crate overwrote the upper bits of
+// INTERRUPT_CFG when it set the lower ones; every setting here is a
+// masked update.
+pub fn reg_update<P: Lps22Port>(p: P, reg: Int, mask: Int, fl: Int) -> Bool [hw]
+    let Some(old) = reg_read(p, reg) else return false
+    let next = (old & (0xFF ^ mask)) | (fl & mask)
+    if not p.write_reg(reg, next)
+        return false
+    let Some(back) = reg_read(p, reg) else return false
+    (back & mask) == (fl & mask)
+
+// A masked update of CTRL_REG2 without its self-clearing bits: BOOT,
+// SWRESET and ONE_SHOT are written as 0 whatever they read, so an update
+// never restarts a reset, a reboot or a conversion that is in flight.
+fn ctrl2_update<P: Lps22Port>(p: P, mask: Int, fl: Int) -> Bool [hw]
+    let Some(old) = reg_read(p, CTRL_REG2) else return false
+    let next = (old & (0xFF ^ CR2_SELF_CLEAR) & (0xFF ^ mask)) | (fl & mask)
+    if not p.write_reg(CTRL_REG2, next)
+        return false
+    let Some(back) = reg_read(p, CTRL_REG2) else return false
+    (back & mask) == (fl & mask)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// The family WHO_AM_I names: `FAM_HB` for 0xB1, `FAM_HH` for 0xB3,
+// `FAM_NONE` for a part that answers another byte, and -1 when the part
+// did not answer.  An SPI bus no part drives reads 0xFF and one held low
+// reads 0x00; both are `FAM_NONE`.
+pub fn family_detect<P: Lps22Port>(p: P) -> Int [hw]
+    let Some(who) = reg_read(p, WHO_AM_I) else return -1
+    if who == ID_HB
+        return FAM_HB
+    if who == ID_HH
+        return FAM_HH
+    FAM_NONE
+
+// Makes the bus ready and reads the family: `FAM_HB` or `FAM_HH`, and
+// `FAM_NONE` when the wiring does not suit the bus, the part did not
+// answer or it is neither part.  What `begin` sets the family from.
+pub fn family_find<P: Lps22Port>(p: P) -> Int [hw]
+    if not p.setup()
+        return FAM_NONE
+    let f = family_detect(p)
+    if f != FAM_HB and f != FAM_HH
+        return FAM_NONE
+    f
+
+// WHO_AM_I as a `DeviceId`, or `None` when no part answers or the byte is
+// neither of the two.
+pub fn id_read<P: Lps22Port>(p: P) -> ?DeviceId [hw]
+    let Some(who) = reg_read(p, WHO_AM_I) else return None
+    if who != ID_HB and who != ID_HH
+        return None
+    Some(DeviceId { who: who, rev: None })
+
+// ── Settings ─────────────────────────────────────────────────────────
+
+// The output data rate code in CTRL_REG1, 0 to 7, or -1 when the part
+// did not answer.
+pub fn odr_get<P: Lps22Port>(p: P) -> Int [hw]
+    let Some(c) = reg_read(p, CTRL_REG1) else return -1
+    (c & CR1_ODR_MASK) >> 4
+
+// Sets the output data rate: 0 powers the part down, which is the state a
+// one-shot conversion needs; 1 to 5 are 1, 10, 25, 50 and 75 Hz; the
+// LPS22HH has 6 and 7 for 100 and 200 Hz as well.  Whether the part took
+// it.  A code the part does not have is refused, and so is a part whose
+// family is not known.
+//
+// Fix kept: with the low-pass filter on, the LPS22HB's filter is reset by
+// reading LPFP_RES after the rate is set, "in order to avoid the
+// transitory phase" (datasheet 9.23; AN4833).  The LPS22HH has no such
+// register.
+pub fn odr_set<P: Lps22Port>(p: P, code: Int) -> Bool [hw]
+    let fam = p.family()
+    if fam == FAM_NONE or code < 0 or code > odr_max(fam)
+        return false
+    if not reg_update(p, CTRL_REG1, CR1_ODR_MASK, code << 4)
+        return false
+    if fam == FAM_HB and code != 0
+        let Some(c) = reg_read(p, CTRL_REG1) else return false
+        if (c & CR1_EN_LPFP) != 0
+            return reg_read(p, LPFP_RES) != None
+    true
+
+// Puts the part in power-down (ODR 0); the output registers keep the last
+// result.
+pub fn power_down<P: Lps22Port>(p: P) -> Bool [hw]
+    odr_set(p, 0)
+
+// Sets the low-pass filter on the pressure: 0 is off (the bandwidth is
+// ODR/2), 1 is ODR/9 and 2 is ODR/20 (CTRL_REG1 Table 18).  Whether the
+// part took it.
+pub fn lpf_set<P: Lps22Port>(p: P, mode: Int) -> Bool [hw]
+    if mode < 0 or mode > 2
+        return false
+    var fl = 0
+    if mode >= 1
+        fl = CR1_EN_LPFP
+    if mode == 2
+        fl = fl | CR1_LPFP_CFG
+    reg_update(p, CTRL_REG1, CR1_EN_LPFP | CR1_LPFP_CFG, fl)
+
+// Turns block data update on or off.  `begin` turns it on.
+pub fn bdu_set<P: Lps22Port>(p: P, on: Bool) -> Bool [hw]
+    var fl = 0
+    if on
+        fl = CR1_BDU
+    reg_update(p, CTRL_REG1, CR1_BDU, fl)
+
+// Turns the register address increment on or off (CTRL_REG2).  It is on
+// at reset, and a multi-byte read needs it on.
+pub fn autoinc_set<P: Lps22Port>(p: P, on: Bool) -> Bool [hw]
+    var fl = 0
+    if on
+        fl = CR2_IF_ADD_INC
+    ctrl2_update(p, CR2_IF_ADD_INC, fl)
+
+// Selects the low-noise (`on`) or low-current mode.  On the LPS22HB this
+// is RES_CONF's LC_EN, which "must be changed only with the device in
+// power down" and which is 0, low-noise, at reset; a call with the part
+// running is refused.  On the LPS22HH it is CTRL_REG2's LOW_NOISE_EN, and
+// ST's header offers low-noise only at the rates up to 75 Hz (codes 1 to
+// 5), so it is refused above; not read from the datasheet.  Whether the
+// part took it.
+pub fn low_noise_set<P: Lps22Port>(p: P, on: Bool) -> Bool [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return false
+    let odr = odr_get(p)
+    if odr < 0
+        return false
+    if fam == FAM_HB
+        if odr != 0
+            return false
+        var lc = RES_LC_EN
+        if on
+            lc = 0
+        return reg_update(p, RES_CONF, RES_LC_EN, lc)
+    if on and odr > 5
+        return false
+    var fl = 0
+    if on
+        fl = CR2_HH_LOW_NOISE
+    ctrl2_update(p, CR2_HH_LOW_NOISE, fl)
+
+// Resets the part's registers with SWRESET and waits for the bit to
+// clear: whether it did.  The factory trimming is not touched; `reboot`
+// reloads it.
+pub fn reset<P: Lps22Port>(p: P) -> Bool [hw]
+    if not p.write_reg(CTRL_REG2, CR2_SWRESET)
+        return false
+    for _i in 0..POLLS
+        let Some(c) = reg_read(p, CTRL_REG2) else return false
+        if (c & CR2_SWRESET) == 0
+            return true
+    false
+
+// Reloads the factory trimming with BOOT and waits for the boot phase to
+// end (INT_SOURCE's boot flag, bit 7 on both parts): whether it did.
+pub fn reboot<P: Lps22Port>(p: P) -> Bool [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return false
+    if not p.write_reg(CTRL_REG2, CR2_BOOT)
+        return false
+    for _i in 0..POLLS
+        let Some(s) = reg_read(p, r_int_source(fam)) else return false
+        let Some(c) = reg_read(p, CTRL_REG2) else return false
+        if (s & INT_BOOT) == 0 and (c & CR2_BOOT) == 0
+            return true
+    false
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+// The pressure count, 24 bits, read as one burst that ends at
+// PRESS_OUT_H so BDU releases it: signed, or `None` when the part did not
+// answer.
+pub fn pressure_raw<P: Lps22Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(PRESS_OUT_XL, 3, var b)
+        return None
+    Some(dev_bus.dev_sign_extend((b[2] as Int << 16) | (b[1] as Int << 8) | b[0] as Int, 24))
+
+// The temperature count, 16 bits, read as one burst that ends at
+// TEMP_OUT_H: signed, or `None` when the part did not answer.
+pub fn temperature_raw<P: Lps22Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(TEMP_OUT_L, 2, var b)
+        return None
+    Some(dev_bus.dev_sign_extend((b[1] as Int << 8) | b[0] as Int, 16))
+
+// The latest result: the pressure in millipascals and the temperature in
+// millidegrees.  `None` when the part did not answer, when the family is
+// not known, and when the pressure count is 0, which is what the output
+// registers hold before the first conversion.
+pub fn sample_read<P: Lps22Port>(p: P) -> ?Lps22Sample [hw]
+    if p.family() == FAM_NONE
+        return None
+    let Some(rp) = pressure_raw(p) else return None
+    let Some(rt) = temperature_raw(p) else return None
+    if rp == 0
+        return None
+    Some(Lps22Sample { milli_pa: pressure_mpa(rp), milli_c: temp_milli_c(rt) })
+
+// The latest pressure rounded to a pascal; `None` as for `sample_read`.
+pub fn baro_read_of<P: Lps22Port>(p: P) -> ?Pascals [hw]
+    if p.family() == FAM_NONE
+        return None
+    let Some(rp) = pressure_raw(p) else return None
+    if rp == 0
+        return None
+    Some(Pascals { pa: pressure_pa(rp) })
+
+// The latest temperature in millidegrees; `None` when the part did not
+// answer or the family is not known.
+pub fn temp_read_of<P: Lps22Port>(p: P) -> ?TempMilliC [hw]
+    if p.family() == FAM_NONE
+        return None
+    let Some(rt) = temperature_raw(p) else return None
+    Some(TempMilliC { milli_c: temp_milli_c(rt) })
+
+// STATUS: bit 0 P_DA, bit 1 T_DA, bit 4 P_OR and bit 5 T_OR, the same in
+// both parts.  Reading the output registers clears the flags.  -1 when the
+// part did not answer.
+pub fn status_read<P: Lps22Port>(p: P) -> Int [hw]
+    reg_read(p, STATUS) ?? -1
+
+// Whether a pressure and a temperature result are both waiting.
+pub fn data_ready<P: Lps22Port>(p: P) -> Bool [hw]
+    ((reg_read(p, STATUS) ?? 0) & (ST_P_DA | ST_T_DA)) == (ST_P_DA | ST_T_DA)
+
+// Starts a one-shot conversion and answers the time to wait before the
+// result, in microseconds (`conversion_us`).  A part running at a rate
+// converts by itself, so nothing is written and the answer is 0.  -1 when
+// the part did not answer, and for a part whose family is not known.
+//
+// Fix kept: with BDU set the output registers hold a result until its
+// high byte is read (datasheet 9.5), so a result nobody read would leave
+// the next conversion's data unloaded.  The start reads both high bytes
+// first, which costs two transactions and releases the registers.
+pub fn oneshot_start<P: Lps22Port>(p: P) -> Int [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return -1
+    let odr = odr_get(p)
+    if odr < 0
+        return -1
+    if odr != 0
+        return 0
+    let Some(_rp) = pressure_raw(p) else return -1
+    let Some(_rt) = temperature_raw(p) else return -1
+    let Some(c) = reg_read(p, CTRL_REG2) else return -1
+    if not p.write_reg(CTRL_REG2, (c & (0xFF ^ CR2_SELF_CLEAR)) | CR2_ONE_SHOT)
+        return -1
+    conversion_us(fam)
+
+// Whether the one-shot conversion has finished: ONE_SHOT has cleared
+// itself.  `None` when the part did not answer.
+pub fn oneshot_done<P: Lps22Port>(p: P) -> ?Bool [hw]
+    let Some(c) = reg_read(p, CTRL_REG2) else return None
+    Some((c & CR2_ONE_SHOT) == 0)
+
+// One conversion on request, waited for by polling: starts it, polls
+// ONE_SHOT at most `polls` times and reads the result.  `None` when the
+// part did not answer, did not finish in `polls` reads, or the family is
+// not known.
+pub fn sample_oneshot<P: Lps22Port>(p: P, polls: Int) -> ?Lps22Sample [hw]
+    let t = oneshot_start(p)
+    if t < 0
+        return None
+    if t > 0
+        var done = false
+        for _i in 0..polls
+            if oneshot_done(p) == Some(true)
+                done = true
+                break
+        if not done
+            return None
+    sample_read(p)
+
+// ── The interrupt line ───────────────────────────────────────────────
+
+// Sets the level and the output stage of the INT_DRDY pad: `active_low`
+// and `open_drain`.  The two parts keep these bits in different places
+// (HB: CTRL_REG3 bits 7 and 6; HH: CTRL_REG2 bits 6 and 5).  Whether the
+// part took it.
+pub fn irq_pad_set<P: Lps22Port>(p: P, active_low: Bool, open_drain: Bool) -> Bool [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return false
+    if fam == FAM_HH
+        var fl = 0
+        if active_low
+            fl = fl | CR2_HH_INT_H_L
+        if open_drain
+            fl = fl | CR2_HH_PP_OD
+        return ctrl2_update(p, CR2_HH_INT_H_L | CR2_HH_PP_OD, fl)
+    var fl = 0
+    if active_low
+        fl = fl | CR3_HB_INT_H_L
+    if open_drain
+        fl = fl | CR3_HB_PP_OD
+    reg_update(p, CTRL_REG3, CR3_HB_INT_H_L | CR3_HB_PP_OD, fl)
+
+// Chooses what the INT_DRDY pad shows (CTRL_REG3 INT_S, Table 19): 0 the
+// data signals (data-ready and the FIFO flags that are enabled), 1 a
+// pressure above the threshold, 2 below it, 3 either.
+pub fn irq_source_set<P: Lps22Port>(p: P, sel: Int) -> Bool [hw]
+    if sel < 0 or sel > 3
+        return false
+    reg_update(p, CTRL_REG3, CR3_INT_S, sel)
+
+// Turns the data-ready signal on the pad on or off.  `begin` turns it on.
+pub fn drdy_irq<P: Lps22Port>(p: P, on: Bool) -> Bool [hw]
+    var fl = 0
+    if on
+        fl = CR3_DRDY
+    reg_update(p, CTRL_REG3, CR3_DRDY, fl)
+
+// Turns the three FIFO signals on the pad on or off: overrun, watermark
+// reached and full.
+pub fn fifo_irq<P: Lps22Port>(p: P, overrun: Bool, watermark: Bool, full: Bool) -> Bool [hw]
+    var fl = 0
+    if overrun
+        fl = fl | CR3_F_OVR
+    if watermark
+        fl = fl | CR3_F_FTH
+    if full
+        fl = fl | CR3_F_FULL
+    reg_update(p, CTRL_REG3, CR3_F_OVR | CR3_F_FTH | CR3_F_FULL, fl)
+
+// Sets the pressure threshold, in pascals (6.25 Pa a step, held to the
+// register), and answers the pascals the register holds, or -1 when the
+// part did not take it.  The threshold is a difference from the reference
+// pressure when AUTOZERO or AUTORIFP is on, and from 0 otherwise
+// (datasheet 9.1).
+pub fn threshold_set<P: Lps22Port>(p: P, pa: Int) -> Int [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return -1
+    let c = threshold_code(pa, fam)
+    if not reg_write(p, THS_P_L, c & 0xFF)
+        return -1
+    if not reg_write(p, THS_P_L + 1, (c >> 8) & 0xFF)
+        return -1
+    threshold_pa(c)
+
+// The threshold in pascals, or -1 when the part did not answer.
+pub fn threshold_get<P: Lps22Port>(p: P) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(THS_P_L, 2, var b)
+        return -1
+    var hi = b[1] as Int
+    if p.family() == FAM_HH
+        hi = hi & 0x7F
+    threshold_pa((hi << 8) | b[0] as Int)
+
+// Turns the pressure-threshold interrupt on for `high` (above), `low`
+// (below) or both, `latched` or not, and routes it to the pad; with
+// neither it turns the interrupt generator off and puts the data signals
+// back on the pad.  Whether the part took it.  A latched event stays in
+// INT_SOURCE until `int_source` reads it.
+pub fn threshold_irq<P: Lps22Port>(p: P, high: Bool, low: Bool, latched: Bool) -> Bool [hw]
+    var fl = 0
+    var sel = 0
+    if high
+        fl = fl | ICFG_PHE
+        sel = 1
+    if low
+        fl = fl | ICFG_PLE
+        sel = sel + 2
+    if sel != 0
+        fl = fl | ICFG_DIFF_EN
+    if latched
+        fl = fl | ICFG_LIR
+    if not reg_update(p, INTERRUPT_CFG, ICFG_PHE | ICFG_PLE | ICFG_LIR | ICFG_DIFF_EN, fl)
+        return false
+    irq_source_set(p, sel)
+
+// INT_SOURCE as one byte: bit 0 a pressure above the threshold, bit 1
+// below it, bit 2 an interrupt is active, bit 7 the part is rebooting.
+// Reading it clears a latched event.  -1 when the part did not answer or
+// the family is not known.
+pub fn int_source<P: Lps22Port>(p: P) -> Int [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return -1
+    reg_read(p, r_int_source(fam)) ?? -1
+
+// ── The reference pressure and the offset ────────────────────────────
+
+// Takes the next pressure as the reference: AUTOZERO, which clears
+// itself after the first conversion, so the output and the interrupt
+// compare against it from then on (`on`); or leaves that mode and clears
+// the reference register (RESET_AZ).  Whether the part took it.
+//
+// The output pressure is then a difference, and `baro_read` is no longer
+// an absolute pressure.
+pub fn autozero<P: Lps22Port>(p: P, on: Bool) -> Bool [hw]
+    if on
+        return reg_update(p, INTERRUPT_CFG, ICFG_AUTOZERO, ICFG_AUTOZERO)
+    reg_update(p, INTERRUPT_CFG, ICFG_RESET_AZ, ICFG_RESET_AZ)
+
+// Takes the next pressure as the reference for the interrupt only
+// (AUTORIFP); the output shows the difference from the offset in RPDS.
+// `on` false leaves the mode (RESET_ARP).  Whether the part took it.
+pub fn autorefp<P: Lps22Port>(p: P, on: Bool) -> Bool [hw]
+    if on
+        return reg_update(p, INTERRUPT_CFG, ICFG_AUTORIFP, ICFG_AUTORIFP)
+    reg_update(p, INTERRUPT_CFG, ICFG_RESET_ARP, ICFG_RESET_ARP)
+
+// The reference pressure register as a signed count: 24 bits on the
+// LPS22HB, 16 on the LPS22HH.  Fix kept: the lps22hb crate read it
+// unsigned, and the datasheet says it is two's complement.  `None` when
+// the part did not answer or the family is not known.
+pub fn ref_read<P: Lps22Port>(p: P) -> ?Int [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return None
+    var n = 3
+    if fam == FAM_HH
+        n = 2
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(0x15, n, var b)
+        return None
+    if fam == FAM_HH
+        return Some(dev_bus.dev_sign_extend((b[1] as Int << 8) | b[0] as Int, 16))
+    Some(dev_bus.dev_sign_extend((b[2] as Int << 16) | (b[1] as Int << 8) | b[0] as Int, 24))
+
+// Writes the one-point-calibration offset RPDS, a signed 16-bit count,
+// subtracted from the pressure output.  Whether the part took it.
+pub fn offset_set<P: Lps22Port>(p: P, counts: Int) -> Bool [hw]
+    if counts < -32768 or counts > 32767
+        return false
+    if not reg_write(p, RPDS_L, counts & 0xFF)
+        return false
+    reg_write(p, RPDS_L + 1, (counts >> 8) & 0xFF)
+
+// The offset RPDS as a signed count, or `None`.
+pub fn offset_get<P: Lps22Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(RPDS_L, 2, var b)
+        return None
+    Some(dev_bus.dev_sign_extend((b[1] as Int << 8) | b[0] as Int, 16))
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+// Sets the FIFO mode (`FIFO_*`) and the watermark, 0 to 31 on the
+// LPS22HB and 0 to 127 on the LPS22HH, and turns the FIFO on or off with
+// it.  Whether the part took it; a mode the part does not have and a
+// watermark out of range are refused.
+//
+// The LPS22HB turns the FIFO on in CTRL_REG2's FIFO_EN, which is set here
+// for every mode but bypass; the LPS22HH has no such bit, and its FIFO
+// runs when the mode is not bypass.  Datasheet 5: "To guarantee the
+// switching into and out of FIFO mode, discard the first sample
+// acquired"; `fifo_take` does not, and a program that needs it reads one
+// sample after changing the mode.
+pub fn fifo_set<P: Lps22Port>(p: P, mode: Int, watermark: Int) -> Bool [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return false
+    let code = fifo_code(fam, mode)
+    if code < 0 or watermark < 0 or watermark >= fifo_depth(fam)
+        return false
+    if fam == FAM_HH
+        if not reg_write(p, 0x14, watermark)
+            return false
+        return reg_write(p, r_fifo_ctrl(fam), code)
+    var en = 0
+    if code != 0
+        en = CR2_HB_FIFO_EN
+    if not ctrl2_update(p, CR2_HB_FIFO_EN | CR2_HB_STOP_FTH, en)
+        return false
+    reg_write(p, r_fifo_ctrl(fam), (code << 5) | watermark)
+
+// The number of samples in the FIFO, or -1 when the part did not answer
+// or the family is not known.  The LPS22HB's count is the low 6 bits of
+// FIFO_STATUS (0 to 32).
+pub fn fifo_level<P: Lps22Port>(p: P) -> Int [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return -1
+    let Some(c) = reg_read(p, r_fifo_count(fam)) else return -1
+    if fam == FAM_HH
+        return c
+    c & 0x3F
+
+// The FIFO flags as one byte for both parts: bit 0 the watermark is
+// reached, bit 1 a sample was overwritten (overrun), bit 2 the FIFO is
+// full.  -1 when the part did not answer or the family is not known.
+// The LPS22HB's FIFO_STATUS holds the first two in bits 7 and 6 and
+// is full at a count of 32; the LPS22HH's FIFO_STATUS2 (0x26) holds the
+// watermark in bit 7, the overrun in bit 6 and full in bit 5.
+pub fn fifo_flags<P: Lps22Port>(p: P) -> Int [hw]
+    let fam = p.family()
+    if fam == FAM_NONE
+        return -1
+    if fam == FAM_HH
+        let Some(f) = reg_read(p, 0x26) else return -1
+        return ((f >> 7) & 1) | (((f >> 6) & 1) << 1) | (((f >> 5) & 1) << 2)
+    let Some(f) = reg_read(p, r_fifo_count(fam)) else return -1
+    var full = 0
+    if (f & 0x3F) == 32
+        full = 4
+    ((f >> 7) & 1) | (((f >> 6) & 1) << 1) | full
+
+// Takes up to 32 samples out of the FIFO, oldest first, pressures into
+// `press` in millipascals and temperatures into `temp` in millidegrees,
+// and answers how many it took; both lists are emptied first.  Each
+// sample is 5 bytes read as one burst, from the output registers on the
+// LPS22HB (the FIFO rolls them to 0x28 again) and from FIFO_DATA_OUT at
+// 0x78 on the LPS22HH.  -1 when the part did not answer or the family is
+// not known.  A FIFO deeper than 32 is drained by calling it again.
+pub fn fifo_take<P: Lps22Port>(p: P, var press: Lps22Samples, var temp: Lps22Samples) -> Int [hw]
+    press.clear()
+    temp.clear()
+    let fam = p.family()
+    let n = fifo_level(p)
+    if n < 0
+        return -1
+    var first = PRESS_OUT_XL
+    if fam == FAM_HH
+        first = FIFO_OUT_HH
+    var taken = 0
+    for _i in 0..n
+        if taken >= 32
+            break
+        var b: DevBytes = Vec.new()
+        if not p.read_regs(first, 5, var b)
+            return -1
+        let rp = dev_bus.dev_sign_extend((b[2] as Int << 16) | (b[1] as Int << 8) | b[0] as Int, 24)
+        let rt = dev_bus.dev_sign_extend((b[4] as Int << 8) | b[3] as Int, 16)
+        let _ = press.push(pressure_mpa(rp))
+        let _ = temp.push(temp_milli_c(rt))
+        taken = taken + 1
+    taken
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+// Brings the part up: the bus made ready; WHO_AM_I checked against the
+// family the port names; SWRESET; register address increment and BDU
+// on; ODR 0, which is power-down and one-shot mode; the data-ready
+// signal on the pad, active high and push-pull.  Answers whether the part
+// answered as the family the port names and took every setting.
+// Conversions start with `oneshot_start`, or with `odr_set`.
+pub fn start<P: Lps22Port>(p: P) -> Bool [hw]
+    if not p.setup()
+        return false
+    let fam = p.family()
+    if fam == FAM_NONE or family_detect(p) != fam
+        return false
+    if not reset(p)
+        return false
+    autoinc_set(p, true) and bdu_set(p, true) and odr_set(p, 0) and irq_pad_set(p, false, false) and drdy_irq(p, true)
+
+// ── The awaitable data-ready line ────────────────────────────────────
+
+// Arms the INT_DRDY line on a pin-edge source: the Future `f` resolves
+// with the level captured when the line rises, which is when a
+// conversion has finished with the pad active high, as `start` leaves
+// it.  `edge` is any implementation of embedded-hal-nv's `AsyncEdge`; no
+// board's GPIO implements it today, so the source is a program's own
+// interrupt glue, or a double.  The caller makes `f` with
+// `core.rt.future_new` and awaits it with `core.rt.future_await`, then
+// reads the result with `sample_read`.  Answers 0 when armed, and -1
+// when the wiring has no interrupt pin or the source refused.
+pub fn drdy_arm<E: AsyncEdge[e]>(edge: E, w: DeviceWiring, f: Future) -> Int [e]
+    let Some(irq) = w.irq else return -1
+    edge.edge_arm(irq, 0, f)
+
+// Takes the arm back: whether it was still armed.  See `AsyncEdge`.
+pub fn drdy_disarm<E: AsyncEdge[e]>(edge: E, w: DeviceWiring) -> Bool [e]
+    let Some(irq) = w.irq else return false
+    edge.edge_disarm(irq)
+
+// ── The part on an I2C bus ───────────────────────────────────────────
+
+// An LPS22HB or LPS22HH on a board's I2C bus at the address `w.addr`,
+// 0x5C or 0x5D, with the board's GPIO for the INT_DRDY line.  `fam` is
+// the register map in use: `attach` leaves it `FAM_NONE` and `begin` sets
+// it from WHO_AM_I; `with_family` names it.
+pub @value
+struct Lps22
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+    fam: Int
+
+impl Lps22Port for Lps22
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    fn family(self) -> Int
+        self.fam
+
+impl Lps22
+    // The part at `w.addr` on the board's I2C bus, as a board's device
+    // table builds it.  Nothing is sent, and the family is not known
+    // until `begin`.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Lps22
+        Lps22 { bus: bus, pins: pins, w: w, fam: FAM_NONE }
+
+    // The same part with the family named, for a program that knows which
+    // chip is on its board and does not call `begin`.
+    fn with_family(self, fam: Int) -> Lps22
+        Lps22 { bus: self.bus, pins: self.pins, w: self.w, fam: fam }
+
+    // Reads WHO_AM_I, takes the family from it and brings the part up
+    // (`start`).  Answers whether the part answered as an LPS22HB or an
+    // LPS22HH and took every setting.
+    fn begin(var self) -> Bool [hw]
+        self.fam = family_find(self)
+        self.fam != FAM_NONE and start(self)
+
+    // The family in use.
+    fn family_in_use(self) -> Int
+        self.fam
+
+    // One register's byte, `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    // Writes a register and reads it back.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The latest result, millipascals and millidegrees.
+    fn sample(self) -> ?Lps22Sample [hw]
+        sample_read(self)
+
+    // One conversion on request, polled at most `polls` times.
+    fn sample_once(self, polls: Int) -> ?Lps22Sample [hw]
+        sample_oneshot(self, polls)
+
+    // Whether a pressure and a temperature result are waiting.
+    fn ready(self) -> Bool [hw]
+        data_ready(self)
+
+    // Sets the output data rate code; 0 is power-down.
+    fn set_rate(self, code: Int) -> Bool [hw]
+        odr_set(self, code)
+
+    // Sets the low-pass filter, 0 off, 1 ODR/9, 2 ODR/20.
+    fn set_filter(self, mode: Int) -> Bool [hw]
+        lpf_set(self, mode)
+
+    // Sets the FIFO mode and the watermark.
+    fn set_fifo(self, mode: Int, watermark: Int) -> Bool [hw]
+        fifo_set(self, mode, watermark)
+
+    // Takes the samples out of the FIFO.
+    fn fifo_drain(self, var press: Lps22Samples, var temp: Lps22Samples) -> Int [hw]
+        fifo_take(self, var press, var temp)
+
+    // Sets the pressure threshold in pascals; answers the pascals held.
+    fn set_threshold(self, pa: Int) -> Int [hw]
+        threshold_set(self, pa)
+
+    // Turns the threshold interrupt on, above and below, latched or not.
+    fn threshold_interrupt(self, high: Bool, low: Bool, latched: Bool) -> Bool [hw]
+        threshold_irq(self, high, low, latched)
+
+    // INT_SOURCE; reading it clears a latched event.
+    fn interrupt_source(self) -> Int [hw]
+        int_source(self)
+
+    // The level of the INT_DRDY line, -1 for a wiring with none.
+    fn irq(self) -> Int [hw]
+        self.irq_level()
+
+impl Barometer[hw] for Lps22
+    // Starts a one-shot conversion and answers the time to wait in
+    // microseconds, 0 when the part runs at a rate, -1 when the part did
+    // not answer.
+    fn baro_start(self) -> Int [hw]
+        oneshot_start(self)
+
+    // The latest pressure, rounded to a pascal.
+    fn baro_read(self) -> ?Pascals [hw]
+        baro_read_of(self)
+
+impl Thermometer[hw] for Lps22
+    // The same conversion as `baro_start`: one conversion gives both.
+    fn temp_start(self) -> Int [hw]
+        oneshot_start(self)
+
+    // The latest temperature in millidegrees.
+    fn temp_read(self) -> ?TempMilliC [hw]
+        temp_read_of(self)
+
+impl Identifiable[hw] for Lps22
+    // WHO_AM_I, 0xB1 for the LPS22HB and 0xB3 for the LPS22HH.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)
+
+// ── The part on an SPI bus ───────────────────────────────────────────
+
+// An LPS22HB or LPS22HH on a board's SPI bus with the chip select
+// `w.cs`, with the board's GPIO for the chip select and the INT_DRDY
+// line.  `fam` is as for `Lps22`.
+pub @value
+struct Lps22Spi
+    bus: BoardSpi
+    pins: BoardGpio
+    w: DeviceWiring
+    fam: Int
+
+impl Lps22Port for Lps22Spi
+    fn setup(self) -> Bool [hw]
+        spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    fn family(self) -> Int
+        self.fam
+
+impl Lps22Spi
+    // The part on the board's SPI bus with the chip select `w.cs`, as a
+    // board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Lps22Spi
+        Lps22Spi { bus: bus, pins: pins, w: w, fam: FAM_NONE }
+
+    // The same part with the family named.
+    fn with_family(self, fam: Int) -> Lps22Spi
+        Lps22Spi { bus: self.bus, pins: self.pins, w: self.w, fam: fam }
+
+    // Reads WHO_AM_I, takes the family from it and brings the part up.
+    fn begin(var self) -> Bool [hw]
+        self.fam = family_find(self)
+        self.fam != FAM_NONE and start(self)
+
+    // The family in use.
+    fn family_in_use(self) -> Int
+        self.fam
+
+    // One register's byte, `None` when the wiring has no chip select.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self, r)
+
+    // Writes a register and reads it back.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self, r, v)
+
+    // The latest result, millipascals and millidegrees.
+    fn sample(self) -> ?Lps22Sample [hw]
+        sample_read(self)
+
+    // One conversion on request, polled at most `polls` times.
+    fn sample_once(self, polls: Int) -> ?Lps22Sample [hw]
+        sample_oneshot(self, polls)
+
+    // Whether a pressure and a temperature result are waiting.
+    fn ready(self) -> Bool [hw]
+        data_ready(self)
+
+    // Sets the output data rate code; 0 is power-down.
+    fn set_rate(self, code: Int) -> Bool [hw]
+        odr_set(self, code)
+
+    // Sets the low-pass filter, 0 off, 1 ODR/9, 2 ODR/20.
+    fn set_filter(self, mode: Int) -> Bool [hw]
+        lpf_set(self, mode)
+
+    // Sets the FIFO mode and the watermark.
+    fn set_fifo(self, mode: Int, watermark: Int) -> Bool [hw]
+        fifo_set(self, mode, watermark)
+
+    // Takes the samples out of the FIFO.
+    fn fifo_drain(self, var press: Lps22Samples, var temp: Lps22Samples) -> Int [hw]
+        fifo_take(self, var press, var temp)
+
+    // Sets the pressure threshold in pascals; answers the pascals held.
+    fn set_threshold(self, pa: Int) -> Int [hw]
+        threshold_set(self, pa)
+
+    // Turns the threshold interrupt on, above and below, latched or not.
+    fn threshold_interrupt(self, high: Bool, low: Bool, latched: Bool) -> Bool [hw]
+        threshold_irq(self, high, low, latched)
+
+    // INT_SOURCE; reading it clears a latched event.
+    fn interrupt_source(self) -> Int [hw]
+        int_source(self)
+
+    // The level of the INT_DRDY line, -1 for a wiring with none.
+    fn irq(self) -> Int [hw]
+        self.irq_level()
+
+impl Barometer[hw] for Lps22Spi
+    // Starts a one-shot conversion and answers the time to wait.
+    fn baro_start(self) -> Int [hw]
+        oneshot_start(self)
+
+    // The latest pressure, rounded to a pascal.
+    fn baro_read(self) -> ?Pascals [hw]
+        baro_read_of(self)
+
+impl Thermometer[hw] for Lps22Spi
+    // The same conversion as `baro_start`.
+    fn temp_start(self) -> Int [hw]
+        oneshot_start(self)
+
+    // The latest temperature in millidegrees.
+    fn temp_read(self) -> ?TempMilliC [hw]
+        temp_read_of(self)
+
+impl Identifiable[hw] for Lps22Spi
+    // WHO_AM_I, 0xB1 for the LPS22HB and 0xB3 for the LPS22HH.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)
+
+// ── The host scheduler's async form ──────────────────────────────────
+
+// A part on the host scheduler, which implements `BarometerAsync` and
+// `ThermometerAsync`: a measurement starts a one-shot conversion, parks
+// the task for the time `conversion_us` gives, then until ONE_SHOT has
+// cleared, and answers the result.  `dev` is any `Lps22Port`: an `Lps22`
+// or an `Lps22Spi`, or a program's own port.  The struct is not a
+// `@value` struct, since an `async fn` takes none (SPEC § 14.5) and a
+// struct with a generic field cannot be one; `host_of` builds it as one
+// cell of the arena.  The impl is `@tier(app)`: an `async fn` is refused at
+// the embedded tier (E4002).  On a device the awaitable form is
+// `drdy_arm`.
+pub struct Lps22Host<P: Lps22Port>
+    dev: P
+
+// The host-scheduler form of the part `dev`.
+pub @tier(app)
+fn host_of<P: Lps22Port>(dev: P) -> Lps22Host<P>
+    Lps22Host { dev: dev }
+
+// The milliseconds to park for a conversion time in microseconds, rounded
+// up.
+pub fn park_ms(us: Int) -> Int
+    (us + 999) / 1000
+
+// The most 1 ms parks that wait for ONE_SHOT to clear after the first park.
+let HOST_POLLS = 50
+
+impl BarometerAsync[hw, time] for Lps22Host
+    @tier(app)
+    async fn baro_measure(self) -> ?Pascals [hw, time]
+        let t = oneshot_start(self.dev)
+        if t < 0
+            return None
+        if t > 0
+            core.rt.sleep_ms(park_ms(t))
+            for _i in 0..HOST_POLLS
+                if oneshot_done(self.dev) == Some(true)
+                    break
+                core.rt.sleep_ms(1)
+        baro_read_of(self.dev)
+
+impl ThermometerAsync[hw, time] for Lps22Host
+    @tier(app)
+    async fn temp_measure(self) -> ?TempMilliC [hw, time]
+        let t = oneshot_start(self.dev)
+        if t < 0
+            return None
+        if t > 0
+            core.rt.sleep_ms(park_ms(t))
+            for _i in 0..HOST_POLLS
+                if oneshot_done(self.dev) == Some(true)
+                    break
+                core.rt.sleep_ms(1)
+        temp_read_of(self.dev)

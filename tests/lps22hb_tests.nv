@@ -1,0 +1,1436 @@
+// lps22hb_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus and on an SPI bus the way ST's LPS22HB
+// datasheet (DocID027083 Rev 5, sections 4 to 9) and ST's LPS22HH register
+// header (`lps22hh_reg.h`) say the two parts do, so the framing, WHO_AM_I,
+// the conversions, the settings, the one-shot conversion with its
+// self-clearing bit, block data update, the FIFO, the thresholds and the
+// bring-up are checked on the host, one transaction at a time.
+//
+// The double's state, in `st`: 3 is the family (1 LPS22HB, 2 LPS22HH), 4 is
+// 1 when a part is there, 9 is 1 inside an SPI transaction, 0 to 2 are the
+// SPI state (0 is 0 before a control byte, 1 the register, 2 the read
+// flag), 20 and 21 the SPI clock and mode, 22 the I2C clock, 60 the reads
+// of CTRL_REG2 a one-shot conversion stays busy for, 61 and 62 the next
+// conversion's pressure and temperature counts, 65 is 1 when a conversion
+// never finishes, 66 the reads a reset stays busy for, 67 is 1 when a
+// reset never finishes, 69 the reads a reboot stays busy for, 70 the I2C
+// address, 80 and 81 are 1 while the pressure and the temperature
+// results are held by block data update, 82 and 83 the P_DA and T_DA
+// flags, 84 and 85 the P_OR and T_OR flags, 86 the one-shot busy count, 87
+// the reset busy count, 88 the reboot busy count, 89 the INT_SOURCE
+// events, 90 the FIFO overrun flag, 98 the samples put in the FIFO and 10
+// the samples taken, 99 the entries in the log.  `fifo` holds the FIFO's
+// samples as 5 bytes each.  The log is: a register written is 1, the
+// register and the value; a register read is 2, the first register and
+// the count; an SPI transaction is 3, the bytes clocked out, -1.
+
+use std.test
+use core.rt
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_baro.{ Pascals, Barometer, BarometerAsync }
+use dev_thermo.{ TempMilliC, Thermometer, ThermometerAsync }
+use dev_id.{ DeviceId, Identifiable }
+use lps22hb
+use lps22hb.{ Lps22, Lps22Spi, Lps22Port, Lps22Sample, Lps22Samples, Lps22Host }
+
+// ── The double ───────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_list(c: Chip) -> [Int]
+    var out: [Int] = []
+    for i in 0..at(c.st, 99)
+        list.push(out, at(c.log, i))
+    out
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+fn is_hh(c: Chip) -> Bool
+    at(c.st, 3) == 2
+
+// The registers at their reset values: CTRL_REG2 has IF_ADD_INC set.
+fn defaults(c: Chip)
+    for r in [0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A]
+        c.regs.insert(r, 0)
+    c.regs.insert(0x11, 0x10)
+
+// A chip of the family: 1 the LPS22HB, 2 the LPS22HH, at the address 0x5C.
+fn chip(fam: Int) -> Chip
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        deaf: HashMap.new(),
+        mute: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new() }
+    c.st.insert(3, fam)
+    c.st.insert(4, 1)
+    c.st.insert(70, 0x5C)
+    c.st.insert(61, 4150272)
+    c.st.insert(62, 2500)
+    defaults(c)
+    c
+
+fn who(c: Chip) -> Int
+    if is_hh(c)
+        return 0xB3
+    0xB1
+
+// The block data update bit.
+fn bdu(c: Chip) -> Bool
+    (at(c.regs, 0x10) & 0x02) != 0
+
+// A conversion's results reach the output registers.  With BDU set a result
+// that was not read holds the registers, and the new one sets its overrun
+// flag instead.
+fn load_result(c: Chip)
+    let rp = at(c.st, 61)
+    let rt = at(c.st, 62)
+    if bdu(c) and at(c.st, 80) == 1
+        c.st.insert(84, 1)
+    else
+        c.regs.insert(0x28, rp & 0xFF)
+        c.regs.insert(0x29, (rp >> 8) & 0xFF)
+        c.regs.insert(0x2A, (rp >> 16) & 0xFF)
+        c.st.insert(82, 1)
+        if bdu(c)
+            c.st.insert(80, 1)
+    if bdu(c) and at(c.st, 81) == 1
+        c.st.insert(85, 1)
+    else
+        c.regs.insert(0x2B, rt & 0xFF)
+        c.regs.insert(0x2C, (rt >> 8) & 0xFF)
+        c.st.insert(83, 1)
+        if bdu(c)
+            c.st.insert(81, 1)
+
+// One period of continuous conversion, or the end of a one-shot.
+fn convert(c: Chip)
+    load_result(c)
+
+// Sets the counts the next conversion produces.
+fn set_result(c: Chip, rp: Int, rt: Int)
+    c.st.insert(61, rp)
+    c.st.insert(62, rt)
+
+// A sample put in the FIFO: the pressure count and the temperature count.
+fn fifo_put(c: Chip, rp: Int, rt: Int)
+    let k = at(c.st, 98) * 5
+    c.fifo.insert(k, rp & 0xFF)
+    c.fifo.insert(k + 1, (rp >> 8) & 0xFF)
+    c.fifo.insert(k + 2, (rp >> 16) & 0xFF)
+    c.fifo.insert(k + 3, rt & 0xFF)
+    c.fifo.insert(k + 4, (rt >> 8) & 0xFF)
+    c.st.insert(98, at(c.st, 98) + 1)
+
+fn fifo_left(c: Chip) -> Int
+    at(c.st, 98) - at(c.st, 10)
+
+// The FIFO answers reads of the output registers (the LPS22HB) or of
+// FIFO_DATA_OUT (the LPS22HH) when its mode is not bypass.
+fn fifo_on(c: Chip) -> Bool
+    if is_hh(c)
+        return (at(c.regs, 0x13) & 0x07) != 0
+    (at(c.regs, 0x11) & 0x40) != 0 and (at(c.regs, 0x14) >> 5) != 0
+
+fn fifo_base(c: Chip) -> Int
+    if is_hh(c)
+        return 0x78
+    0x28
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x0F
+        if at(c.regs, 0x0F) != 0
+            return at(c.regs, 0x0F)
+        return who(c)
+    if reg == 0x11
+        var v = at(c.regs, 0x11) & 0x7A
+        if at(c.st, 86) > 0
+            v = v | 0x01
+            c.st.insert(86, at(c.st, 86) - 1)
+            if at(c.st, 86) == 0
+                convert(c)
+        if at(c.st, 87) > 0
+            v = v | 0x04
+            c.st.insert(87, at(c.st, 87) - 1)
+        if at(c.st, 88) > 0
+            v = v | 0x80
+            c.st.insert(88, at(c.st, 88) - 1)
+        return v
+    if reg == 0x27
+        var v = 0
+        if at(c.st, 82) == 1
+            v = v | 0x01
+        if at(c.st, 83) == 1
+            v = v | 0x02
+        if at(c.st, 84) == 1
+            v = v | 0x10
+        if at(c.st, 85) == 1
+            v = v | 0x20
+        return v
+    var isrc = 0x25
+    if is_hh(c)
+        isrc = 0x24
+    if reg == isrc
+        var v = at(c.st, 89)
+        c.st.insert(89, 0)
+        if at(c.st, 88) > 0
+            v = v | 0x80
+        return v
+    if fifo_on(c) and reg >= fifo_base(c) and reg <= fifo_base(c) + 4
+        if fifo_left(c) <= 0
+            return 0
+        let k = at(c.st, 10) * 5 + (reg - fifo_base(c))
+        let v = at(c.fifo, k)
+        if reg == fifo_base(c) + 4
+            c.st.insert(10, at(c.st, 10) + 1)
+        return v
+    if reg == 0x25 and is_hh(c)
+        return fifo_left(c)
+    if reg == 0x26
+        let wtm = at(c.regs, 0x14) & 0x7F
+        if is_hh(c)
+            var f = 0
+            if wtm > 0 and fifo_left(c) >= wtm
+                f = f | 0x80
+            if at(c.st, 90) == 1
+                f = f | 0x40
+            if fifo_left(c) >= 128
+                f = f | 0x20
+            return f
+        var f = fifo_left(c) & 0x3F
+        if (at(c.regs, 0x14) & 0x1F) > 0 and fifo_left(c) >= (at(c.regs, 0x14) & 0x1F)
+            f = f | 0x80
+        if at(c.st, 90) == 1
+            f = f | 0x40
+        return f
+    if reg == 0x2A
+        c.st.insert(80, 0)
+        c.st.insert(82, 0)
+        c.st.insert(84, 0)
+    if reg == 0x2C
+        c.st.insert(81, 0)
+        c.st.insert(83, 0)
+        c.st.insert(85, 0)
+    if reg == 0x33
+        return 0
+    at(c.regs, reg)
+
+// A write to a register.  CTRL_REG2's three self-clearing bits start their
+// actions and are not stored.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if reg == 0x0F or reg >= 0x24 and reg <= 0x2C or reg == 0x33
+        return
+    if reg == 0x11
+        c.regs.insert(0x11, v & 0x7A)
+        if (v & 0x04) != 0
+            defaults(c)
+            c.st.insert(87, at(c.st, 66))
+            if at(c.st, 67) == 1
+                c.st.insert(87, 1000000)
+        if (v & 0x80) != 0
+            c.st.insert(88, at(c.st, 69))
+        if (v & 0x01) != 0 and ((at(c.regs, 0x10) >> 4) & 7) == 0
+            c.st.insert(86, at(c.st, 60))
+            if at(c.st, 65) == 1
+                c.st.insert(86, 1000000)
+            if at(c.st, 60) == 0 and at(c.st, 65) == 0
+                convert(c)
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        let r = data[0] as Int
+        if at(self.c.mute, r) == 1
+            return false
+        for i in 1..data.len()
+            log_push(self.c, 1)
+            log_push(self.c, r + i - 1)
+            log_push(self.c, data[i] as Int)
+            chip_write(self.c, r + i - 1, data[i] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0
+            return None
+        let r = tx[0] as Int
+        if at(self.c.deaf, r) == 1
+            return None
+        log_push(self.c, 2)
+        log_push(self.c, r)
+        log_push(self.c, n)
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, chip_read(self.c, r + i) as u8)
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            return 0xFF
+        let r = at(self.c.st, 1)
+        if at(self.c.st, 2) == 1
+            self.c.st.insert(1, (r + 1) & 0x7F)
+            return chip_read(self.c, r)
+        self.c.st.insert(1, (r + 1) & 0x7F)
+        chip_write(self.c, r, b)
+        0xFF
+
+    @tier(app)
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 25) falling starts an SPI
+// transaction and rising ends it.  Pin 7 is the interrupt line.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 25 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 25 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+let WI = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x5C), 7)
+let WS = dev_bus.wiring_irq(dev_bus.wiring_spi(0, 25), 7)
+
+// The two ports.  The family a port names is a field of its own, which
+// the tests change to run a port against the wrong family.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+    fam: Int
+
+impl Lps22Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        lps22hb.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lps22hb.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lps22hb.i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        lps22hb.irq_level_of(self.pins, self.w)
+
+    fn family(self) -> Int
+        self.fam
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+    fam: Int
+
+impl Lps22Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        lps22hb.spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lps22hb.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lps22hb.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        lps22hb.irq_level_of(self.pins, self.w)
+
+    fn family(self) -> Int
+        self.fam
+
+fn i2c(c: Chip, fam: Int) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: WI, fam: fam }
+
+fn spi(c: Chip, fam: Int) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: WS, fam: fam }
+
+// A part that is not on the bus.
+fn absent(fam: Int) -> Chip
+    let c = chip(fam)
+    c.st.insert(4, 0)
+    c
+
+// An I2C part of the family, brought up.
+fn up(fam: Int) -> I2cDut
+    let c = chip(fam)
+    let d = i2c(c, fam)
+    test.assert(lps22hb.start(d))
+    log_clear(c)
+    d
+
+fn chip_of(d: I2cDut) -> Chip
+    d.bus.c
+
+// ── The conversions ──────────────────────────────────────────────────
+
+@test
+fn test_the_pressure_is_4096_counts_a_hectopascal() [io]
+    // 1013.25 hPa x 4096 = 4150272 counts, and a count is 3125/128 mPa.
+    test.assert_eq(lps22hb.pressure_mpa(4150272), 101325000)
+    test.assert_eq(lps22hb.pressure_pa(4150272), 101325)
+    // One count is 24.4140625 mPa: 24.
+    test.assert_eq(lps22hb.pressure_mpa(1), 24)
+    // 4096 counts, 1 hPa, 100 Pa; the negative side is the same.
+    test.assert_eq(lps22hb.pressure_mpa(4096), 100000)
+    test.assert_eq(lps22hb.pressure_mpa(0xFFF000), -100000)
+    test.assert_eq(lps22hb.pressure_pa(0xFFF000), -100)
+    // 0x800000 is the most negative count, -2048 hPa.
+    test.assert_eq(lps22hb.pressure_mpa(0x800000), -204800000)
+    // Rounding to the nearest pascal: 41 counts are 1000.98 mPa, 1 Pa;
+    // 20 counts are 488 mPa, 0 Pa; 21 counts are 512 mPa, 1 Pa.
+    test.assert_eq(lps22hb.pressure_pa(41), 1)
+    test.assert_eq(lps22hb.pressure_pa(20), 0)
+    test.assert_eq(lps22hb.pressure_pa(21), 1)
+    test.assert_eq(lps22hb.pressure_pa(-21), -1)
+    // A count wider than 24 bits is cut to 24.
+    test.assert_eq(lps22hb.pressure_mpa(0x1000000 + 4096), 100000)
+
+@test
+fn test_the_temperature_is_100_counts_a_degree() [io]
+    test.assert_eq(lps22hb.temp_milli_c(2500), 25000)
+    test.assert_eq(lps22hb.temp_milli_c(0), 0)
+    test.assert_eq(lps22hb.temp_milli_c(0xF830), -20000)
+    test.assert_eq(lps22hb.temp_milli_c(0xFFFF), -10)
+    test.assert_eq(lps22hb.temp_milli_c(0x7FFF), 327670)
+
+@test
+fn test_the_threshold_is_a_sixteenth_of_a_hectopascal_a_step() [io]
+    // 1000 hPa is 16000 steps of 6.25 Pa.
+    test.assert_eq(lps22hb.threshold_code(100000, 1), 16000)
+    test.assert_eq(lps22hb.threshold_pa(16000), 100000)
+    test.assert_eq(lps22hb.threshold_code(0, 1), 0)
+    // 10 Pa is 1.6 steps: 2.
+    test.assert_eq(lps22hb.threshold_code(10, 1), 2)
+    test.assert_eq(lps22hb.threshold_pa(2), 13)
+    // The register holds 16 bits on the LPS22HB and 15 on the LPS22HH.
+    test.assert_eq(lps22hb.threshold_code(10000000, 1), 0xFFFF)
+    test.assert_eq(lps22hb.threshold_code(10000000, 2), 0x7FFF)
+    test.assert_eq(lps22hb.threshold_code(-5, 1), 0)
+
+@test
+fn test_the_two_parts_number_the_fifo_modes_differently() [io]
+    let hb = [0, 1, 2, 6, 3, 4, 7]
+    let hh = [0, 1, 2, 3, 7, 6, 5]
+    for m in 0..7
+        test.assert_eq(lps22hb.fifo_code(1, m), hb[m])
+        test.assert_eq(lps22hb.fifo_code(2, m), hh[m])
+    test.assert_eq(lps22hb.fifo_code(1, 9), -1)
+    test.assert_eq(lps22hb.fifo_code(2, 9), -1)
+
+@test
+fn test_the_two_parts_differ_in_depth_rates_and_time() [io]
+    test.assert_eq(lps22hb.fifo_depth(1), 32)
+    test.assert_eq(lps22hb.fifo_depth(2), 128)
+    test.assert_eq(lps22hb.odr_max(1), 5)
+    test.assert_eq(lps22hb.odr_max(2), 7)
+    test.assert_eq(lps22hb.conversion_us(1), 14000)
+    test.assert_eq(lps22hb.conversion_us(2), 6000)
+    test.assert_eq(lps22hb.park_ms(14000), 14)
+    test.assert_eq(lps22hb.park_ms(14001), 15)
+
+// ── The framing of the two buses ─────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_one_transaction_of_a_register_and_a_count() [io]
+    let c = chip(1)
+    let d = i2c(c, 1)
+    var b: DevBytes = Vec.new()
+    test.assert(lps22hb.i2c_read_into(d.bus, d.w, 0x0F, 1, var b))
+    test.assert_eq(b[0] as Int, 0xB1)
+    test.assert(log_list(c) == [2, 0x0F, 1])
+    // A part that is not there does not answer.
+    let a = i2c(absent(1), 1)
+    test.assert(not lps22hb.i2c_read_into(a.bus, a.w, 0x0F, 1, var b))
+    // A wiring with no address cannot be read.
+    test.assert(not lps22hb.i2c_read_into(d.bus, dev_bus.wiring_spi(0, 25), 0x0F, 1, var b))
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io]
+    let c = chip(1)
+    let d = i2c(c, 1)
+    test.assert(lps22hb.i2c_write(d.bus, d.w, 0x10, 0x1FF))
+    test.assert(log_list(c) == [1, 0x10, 0xFF])
+    test.assert(not lps22hb.i2c_write(i2c(absent(1), 1).bus, d.w, 0x10, 1))
+
+@test
+fn test_an_spi_read_sets_bit_7_and_has_no_dummy_byte() [io]
+    let c = chip(2)
+    let d = spi(c, 2)
+    var b: DevBytes = Vec.new()
+    test.assert(lps22hb.spi_read_into(d.bus, d.pins, d.w, 0x0F, 1, var b))
+    test.assert_eq(b[0] as Int, 0xB3)
+    // Chip select falls, the control byte 0x8F and one filler byte go out,
+    // chip select rises.
+    test.assert(log_list(c) == [3, 0x8F, 0xFF, -1])
+    // Several registers in one transaction.
+    log_clear(c)
+    c.regs.insert(0x28, 1)
+    c.regs.insert(0x29, 2)
+    c.regs.insert(0x2A, 3)
+    c.st.insert(1, 0)
+    test.assert(lps22hb.spi_read_into(d.bus, d.pins, d.w, 0x28, 3, var b))
+    test.assert_eq(b.len(), 3)
+    test.assert_eq(b[2] as Int, 3)
+    // A wiring with no chip select answers false.
+    test.assert(not lps22hb.spi_read_into(d.bus, d.pins, dev_bus.wiring_i2c(0, 0x5C), 0x0F, 1, var b))
+
+@test
+fn test_an_spi_write_clears_bit_7() [io]
+    let c = chip(1)
+    let d = spi(c, 1)
+    test.assert(lps22hb.spi_write(d.bus, d.pins, d.w, 0x10, 0x1FF))
+    test.assert(log_list(c) == [3, 0x10, 0xFF, -1])
+    test.assert_eq(at(c.regs, 0x10), 0xFF)
+    test.assert(not lps22hb.spi_write(d.bus, d.pins, dev_bus.wiring_i2c(0, 0x5C), 0x10, 1))
+
+@test
+fn test_setup_makes_the_buses_and_the_pins_ready() [io]
+    let c = chip(1)
+    let d = i2c(c, 1)
+    test.assert(lps22hb.i2c_setup(d.bus, d.pins, d.w))
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 7), 0)
+    test.assert(not lps22hb.i2c_setup(d.bus, d.pins, dev_bus.wiring_spi(0, 25)))
+    let s = spi(c, 1)
+    test.assert(lps22hb.spi_setup(s.bus, s.pins, s.w))
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+    test.assert_eq(at(s.pins.levels, 25), 1)
+    test.assert_eq(at(s.pins.modes, 25), 1)
+    test.assert_eq(at(s.pins.modes, 7), 0)
+    test.assert(not lps22hb.spi_setup(s.bus, s.pins, dev_bus.wiring_i2c(0, 0x5C)))
+    // A wiring with no interrupt pin reads -1.
+    test.assert_eq(lps22hb.irq_level_of(s.pins, dev_bus.wiring_spi(0, 25)), -1)
+    s.pins.levels.insert(7, 1)
+    test.assert_eq(lps22hb.irq_level_of(s.pins, WS), 1)
+    test.assert_eq(d.irq_level(), 0)
+    test.assert_eq(s.irq_level(), 1)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_register_access_reads_writes_and_updates() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.reg_read(d, 0x0F) == Some(0xB1))
+    test.assert(lps22hb.reg_read(i2c(absent(1), 1), 0x0F) == None)
+    // A write is read back; a register that holds another value is false.
+    test.assert(lps22hb.reg_write(d, 0x18, 0x5A))
+    test.assert_eq(at(c.regs, 0x18), 0x5A)
+    c.mute.insert(0x18, 1)
+    test.assert(not lps22hb.reg_write(d, 0x18, 0x11))
+    c.mute.insert(0x18, 0)
+    // The read back disagrees: the register ignores the write.
+    test.assert(not lps22hb.reg_write(d, 0x2A, 0x11))
+    // An update changes only the bits of the mask.
+    c.regs.insert(0x19, 0xF0)
+    test.assert(lps22hb.reg_update(d, 0x19, 0x0F, 0x05))
+    test.assert_eq(at(c.regs, 0x19), 0xF5)
+    test.assert(not lps22hb.reg_update(i2c(absent(1), 1), 0x19, 0x0F, 0x05))
+    c.deaf.insert(0x19, 1)
+    test.assert(not lps22hb.reg_update(d, 0x19, 0x0F, 0x05))
+    c.deaf.insert(0x19, 0)
+    c.mute.insert(0x19, 1)
+    test.assert(not lps22hb.reg_update(d, 0x19, 0x0F, 0x01))
+
+@test
+fn test_who_am_i_is_the_family_switch() [io]
+    for fam in [1, 2]
+        let c = chip(fam)
+        test.assert_eq(lps22hb.family_detect(i2c(c, 0)), fam)
+        test.assert_eq(lps22hb.family_detect(spi(c, 0)), fam)
+        let id = lps22hb.id_read(i2c(c, fam)) ?? DeviceId { who: 0, rev: None }
+        test.assert_eq(id.who, who(c))
+        test.assert(id.rev == None)
+    // Another byte is no family, a missing part does not answer.
+    let o = chip(1)
+    o.regs.insert(0x0F, 0x33)
+    test.assert_eq(lps22hb.family_detect(i2c(o, 0)), 0)
+    test.assert_eq(lps22hb.family_detect(i2c(absent(1), 0)), -1)
+    test.assert(lps22hb.id_read(i2c(absent(1), 1)) == None)
+    // An SPI bus nobody drives reads 0xFF, which is no family.
+    test.assert_eq(lps22hb.family_detect(spi(absent(1), 0)), 0)
+    test.assert(lps22hb.id_read(spi(absent(1), 1)) == None)
+
+// ── Settings ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_output_data_rate_is_set_by_code() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        for code in 0..lps22hb.odr_max(fam) + 1
+            test.assert(lps22hb.odr_set(d, code))
+            test.assert_eq(lps22hb.odr_get(d), code)
+            test.assert_eq((at(c.regs, 0x10) >> 4) & 7, code)
+        // Past the part's table, below zero and for an unknown family.
+        test.assert(not lps22hb.odr_set(d, lps22hb.odr_max(fam) + 1))
+        test.assert(not lps22hb.odr_set(d, -1))
+        test.assert_eq(at(c.regs, 0x10) & 0x02, 0x02)
+    let d = up(1)
+    test.assert(not lps22hb.odr_set(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, 1))
+    test.assert_eq(lps22hb.odr_get(i2c(absent(1), 1)), -1)
+    test.assert(not lps22hb.odr_set(i2c(absent(1), 1), 1))
+    test.assert(lps22hb.power_down(d))
+
+@test
+fn test_the_lpfp_is_reset_after_the_rate_on_the_lps22hb_only() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    // No filter: the rate is set and LPFP_RES is not read.
+    test.assert(lps22hb.odr_set(d, 3))
+    test.assert(log_list(c) == [2, 0x10, 1, 1, 0x10, 0x32, 2, 0x10, 1, 2, 0x10, 1])
+    test.assert(lps22hb.lpf_set(d, 1))
+    log_clear(c)
+    test.assert(lps22hb.odr_set(d, 2))
+    // The filter is on: the register is read after the rate.
+    let l = log_list(c)
+    test.assert_eq(l[l.len() - 3], 2)
+    test.assert_eq(l[l.len() - 2], 0x33)
+    // Powering down with the filter on does not read it.
+    log_clear(c)
+    test.assert(lps22hb.odr_set(d, 0))
+    test.assert(not log_list(c).contains(0x33))
+    // The LPS22HH has no such register.
+    let h = up(2)
+    test.assert(lps22hb.lpf_set(h, 2))
+    log_clear(chip_of(h))
+    test.assert(lps22hb.odr_set(h, 2))
+    test.assert(not log_list(chip_of(h)).contains(0x33))
+
+@test
+fn test_the_low_pass_filter_bits() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        test.assert(lps22hb.lpf_set(d, 1))
+        test.assert_eq(at(c.regs, 0x10) & 0x0C, 0x08)
+        test.assert(lps22hb.lpf_set(d, 2))
+        test.assert_eq(at(c.regs, 0x10) & 0x0C, 0x0C)
+        test.assert(lps22hb.lpf_set(d, 0))
+        test.assert_eq(at(c.regs, 0x10) & 0x0C, 0)
+        test.assert(not lps22hb.lpf_set(d, 3))
+        test.assert(not lps22hb.lpf_set(d, -1))
+        // The other bits stay: BDU was set by the bring-up.
+        test.assert_eq(at(c.regs, 0x10) & 0x02, 0x02)
+
+@test
+fn test_bdu_and_the_address_increment() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.bdu_set(d, false))
+    test.assert_eq(at(c.regs, 0x10) & 0x02, 0)
+    test.assert(lps22hb.bdu_set(d, true))
+    test.assert_eq(at(c.regs, 0x10) & 0x02, 0x02)
+    test.assert(lps22hb.autoinc_set(d, false))
+    test.assert_eq(at(c.regs, 0x11) & 0x10, 0)
+    test.assert(lps22hb.autoinc_set(d, true))
+    test.assert_eq(at(c.regs, 0x11) & 0x10, 0x10)
+    test.assert(not lps22hb.autoinc_set(i2c(absent(1), 1), true))
+
+@test
+fn test_an_update_of_ctrl_reg2_never_writes_a_self_clearing_bit() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    // A one-shot conversion is in flight when IF_ADD_INC is changed: the
+    // write must not carry ONE_SHOT, or it would start another one.
+    c.st.insert(60, 5)
+    test.assert(lps22hb.oneshot_start(d) > 0)
+    log_clear(c)
+    test.assert(lps22hb.autoinc_set(d, false))
+    let l = log_list(c)
+    var wrote = -1
+    var i = 0
+    while i < l.len()
+        if l[i] == 1 and l[i + 1] == 0x11
+            wrote = l[i + 2]
+        i = i + 3
+    test.assert_eq(wrote, 0)
+
+@test
+fn test_low_noise_is_the_lps22hb_s_lc_en_inverted_and_the_lps22hh_s_own_bit() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    // The LPS22HB: LC_EN is 0 for low noise; refused with the part running.
+    test.assert(lps22hb.low_noise_set(d, false))
+    test.assert_eq(at(c.regs, 0x1A) & 1, 1)
+    test.assert(lps22hb.low_noise_set(d, true))
+    test.assert_eq(at(c.regs, 0x1A) & 1, 0)
+    test.assert(lps22hb.odr_set(d, 3))
+    test.assert(not lps22hb.low_noise_set(d, false))
+    let h = up(2)
+    let hc = chip_of(h)
+    test.assert(lps22hb.low_noise_set(h, true))
+    test.assert_eq(at(hc.regs, 0x11) & 0x02, 0x02)
+    test.assert(lps22hb.low_noise_set(h, false))
+    test.assert_eq(at(hc.regs, 0x11) & 0x02, 0)
+    // Low noise at 100 and 200 Hz is refused; low current is not.
+    test.assert(lps22hb.odr_set(h, 5))
+    test.assert(lps22hb.low_noise_set(h, true))
+    test.assert(lps22hb.odr_set(h, 6))
+    test.assert(not lps22hb.low_noise_set(h, true))
+    test.assert(lps22hb.low_noise_set(h, false))
+    test.assert(not lps22hb.low_noise_set(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, true))
+    test.assert(not lps22hb.low_noise_set(i2c(absent(1), 1), true))
+
+@test
+fn test_a_reset_waits_for_swreset_to_clear() [io]
+    let c = chip(1)
+    c.st.insert(66, 3)
+    let d = i2c(c, 1)
+    c.regs.insert(0x10, 0x55)
+    test.assert(lps22hb.reset(d))
+    // The registers are back at their reset values.
+    test.assert_eq(at(c.regs, 0x10), 0)
+    // Three busy reads, then clear.
+    test.assert_eq(at(c.st, 87), 0)
+    // It never clears: refused after the poll bound.
+    let n = chip(1)
+    n.st.insert(67, 1)
+    test.assert(not lps22hb.reset(i2c(n, 1)))
+    // A part that is not there.
+    test.assert(not lps22hb.reset(i2c(absent(1), 1)))
+    // A part that takes the write and stops answering.
+    let m = chip(1)
+    m.deaf.insert(0x11, 1)
+    test.assert(not lps22hb.reset(i2c(m, 1)))
+
+@test
+fn test_a_reboot_waits_for_the_boot_phase_on_the_right_register() [io]
+    for fam in [1, 2]
+        let c = chip(fam)
+        c.st.insert(69, 4)
+        let d = i2c(c, fam)
+        test.assert(lps22hb.reboot(d))
+        test.assert_eq(at(c.st, 88), 0)
+        // The boot flag never ends.
+        let n = chip(fam)
+        n.st.insert(69, 1000000)
+        test.assert(not lps22hb.reboot(i2c(n, fam)))
+        test.assert(not lps22hb.reboot(i2c(absent(fam), fam)))
+        // The INT_SOURCE read fails.
+        let m = chip(fam)
+        var isrc = 0x25
+        if fam == 2
+            isrc = 0x24
+        m.deaf.insert(isrc, 1)
+        test.assert(not lps22hb.reboot(i2c(m, fam)))
+    test.assert(not lps22hb.reboot(i2c(chip(1), 0)))
+
+// ── The bring-up ─────────────────────────────────────────────────────
+
+@test
+fn test_the_bring_up_leaves_the_part_in_one_shot_mode_with_bdu_on() [io]
+    for fam in [1, 2]
+        let c = chip(fam)
+        c.regs.insert(0x10, 0x55)
+        let d = i2c(c, fam)
+        test.assert(lps22hb.start(d))
+        test.assert_eq(at(c.regs, 0x10), 0x02)
+        test.assert_eq(at(c.regs, 0x11) & 0x10, 0x10)
+        // DRDY on the pad, active high, push-pull.
+        test.assert_eq(at(c.regs, 0x12) & 0x04, 0x04)
+        test.assert_eq(at(c.regs, 0x12) & 0xC0, 0)
+        test.assert_eq(at(c.regs, 0x11) & 0x60, 0)
+        let s = chip(fam)
+        test.assert(lps22hb.start(spi(s, fam)))
+        test.assert_eq(at(s.regs, 0x10), 0x02)
+
+@test
+fn test_begin_finds_the_family_after_making_the_bus_ready() [io]
+    for fam in [1, 2]
+        test.assert_eq(lps22hb.family_find(i2c(chip(fam), 0)), fam)
+        test.assert_eq(lps22hb.family_find(spi(chip(fam), 0)), fam)
+    // An unknown byte, a missing part and a wiring the bus cannot use.
+    let o = chip(1)
+    o.regs.insert(0x0F, 0x33)
+    test.assert_eq(lps22hb.family_find(i2c(o, 0)), 0)
+    test.assert_eq(lps22hb.family_find(i2c(absent(1), 0)), 0)
+    let c = chip(1)
+    let w = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 25), fam: 0 }
+    test.assert_eq(lps22hb.family_find(w), 0)
+
+@test
+fn test_the_bring_up_refuses_the_wrong_family_and_a_missing_part() [io]
+    // The port names an LPS22HB, the part is an LPS22HH.
+    test.assert(not lps22hb.start(i2c(chip(2), 1)))
+    test.assert(not lps22hb.start(i2c(chip(1), 2)))
+    test.assert(not lps22hb.start(i2c(chip(1), 0)))
+    test.assert(not lps22hb.start(i2c(absent(1), 1)))
+    // A wiring the bus cannot use.
+    let c = chip(1)
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 25), fam: 1 }
+    test.assert(not lps22hb.start(d))
+    // A reset that never ends.
+    let n = chip(1)
+    n.st.insert(67, 1)
+    test.assert(not lps22hb.start(i2c(n, 1)))
+    // A register that refuses a write: BDU is not held.
+    let m = chip(2)
+    m.mute.insert(0x10, 1)
+    test.assert(not lps22hb.start(i2c(m, 2)))
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_is_a_pressure_and_a_temperature_in_milli_units() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        test.assert(lps22hb.sample_read(d) == None)
+        set_result(c, 4150272, 2500)
+        convert(c)
+        let s = lps22hb.sample_read(d) ?? Lps22Sample { milli_pa: 0, milli_c: 0 }
+        test.assert_eq(s.milli_pa, 101325000)
+        test.assert_eq(s.milli_c, 25000)
+        // The pressure is one burst of 3 bytes that ends at 0x2A and the
+        // temperature one burst of 2 that ends at 0x2C.
+        log_clear(c)
+        let _ = lps22hb.sample_read(d)
+        test.assert(log_list(c) == [2, 0x28, 3, 2, 0x2B, 2])
+        // A cold day: negative temperature, a low pressure.
+        set_result(c, 0xF9A000, 0xF830)
+        convert(c)
+        let t = lps22hb.sample_read(d) ?? Lps22Sample { milli_pa: 0, milli_c: 0 }
+        test.assert_eq(t.milli_pa, lps22hb.pressure_mpa(0xF9A000))
+        test.assert_eq(t.milli_c, -20000)
+        // The trait readings.
+        set_result(c, 4150272, 2500)
+        convert(c)
+        test.assert_eq((lps22hb.baro_read_of(d) ?? Pascals { pa: 0 }).pa, 101325)
+        convert(c)
+        test.assert_eq((lps22hb.temp_read_of(d) ?? TempMilliC { milli_c: 0 }).milli_c, 25000)
+
+@test
+fn test_no_result_is_none() [io]
+    let d = up(1)
+    // The output registers read 0 before the first conversion.
+    test.assert(lps22hb.baro_read_of(d) == None)
+    test.assert(lps22hb.sample_read(d) == None)
+    // A part that is not there, and a family that is not known.
+    test.assert(lps22hb.sample_read(i2c(absent(1), 1)) == None)
+    test.assert(lps22hb.baro_read_of(i2c(absent(1), 1)) == None)
+    test.assert(lps22hb.temp_read_of(i2c(absent(1), 1)) == None)
+    let n = I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }
+    test.assert(lps22hb.sample_read(n) == None)
+    test.assert(lps22hb.baro_read_of(n) == None)
+    test.assert(lps22hb.temp_read_of(n) == None)
+    // The temperature read fails after the pressure read worked.
+    let c = chip_of(d)
+    set_result(c, 4150272, 2500)
+    convert(c)
+    c.deaf.insert(0x2B, 1)
+    test.assert(lps22hb.sample_read(d) == None)
+
+@test
+fn test_the_status_flags_are_p_da_bit_0_and_t_da_bit_1_in_both_parts() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        test.assert_eq(lps22hb.status_read(d), 0)
+        test.assert(not lps22hb.data_ready(d))
+        convert(c)
+        test.assert_eq(lps22hb.status_read(d), 0x03)
+        test.assert(lps22hb.data_ready(d))
+        // Reading the pressure clears P_DA only.
+        let _ = lps22hb.pressure_raw(d)
+        test.assert_eq(lps22hb.status_read(d), 0x02)
+        test.assert(not lps22hb.data_ready(d))
+        let _ = lps22hb.temperature_raw(d)
+        test.assert_eq(lps22hb.status_read(d), 0)
+    test.assert_eq(lps22hb.status_read(i2c(absent(1), 1)), -1)
+    test.assert(not lps22hb.data_ready(i2c(absent(1), 1)))
+
+// ── The one-shot conversion ──────────────────────────────────────────
+
+@test
+fn test_a_one_shot_conversion_starts_with_one_shot_and_ends_when_it_clears() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        c.st.insert(60, 3)
+        test.assert_eq(lps22hb.oneshot_start(d), lps22hb.conversion_us(fam))
+        // ONE_SHOT reads 1 for three reads, then 0.
+        test.assert(lps22hb.oneshot_done(d) == Some(false))
+        test.assert(lps22hb.oneshot_done(d) == Some(false))
+        test.assert(lps22hb.oneshot_done(d) == Some(false))
+        test.assert(lps22hb.oneshot_done(d) == Some(true))
+        test.assert(lps22hb.data_ready(d))
+        let s = lps22hb.sample_read(d) ?? Lps22Sample { milli_pa: 0, milli_c: 0 }
+        test.assert_eq(s.milli_pa, 101325000)
+    test.assert(lps22hb.oneshot_done(i2c(absent(1), 1)) == None)
+
+@test
+fn test_a_running_part_converts_by_itself() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.odr_set(d, 2))
+    log_clear(c)
+    test.assert_eq(lps22hb.oneshot_start(d), 0)
+    // Nothing was written: CTRL_REG1 was read and that is all.
+    test.assert(log_list(c) == [2, 0x10, 1])
+
+@test
+fn test_a_one_shot_start_releases_a_result_nobody_read() [io]
+    // Fix kept: with BDU set a result whose high byte was not read holds the
+    // output registers, and the next conversion's data would never load.
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        set_result(c, 4150272, 2500)
+        convert(c)
+        // Nobody reads it; the pressure is held.
+        set_result(c, 4154368, 2600)
+        c.st.insert(60, 1)
+        test.assert(lps22hb.oneshot_start(d) > 0)
+        test.assert(lps22hb.oneshot_done(d) == Some(false))
+        test.assert(lps22hb.oneshot_done(d) == Some(true))
+        let s = lps22hb.sample_read(d) ?? Lps22Sample { milli_pa: 0, milli_c: 0 }
+        test.assert_eq(s.milli_pa, 101425000)
+        test.assert_eq(s.milli_c, 26000)
+        test.assert_eq(at(c.st, 84), 0)
+
+@test
+fn test_a_one_shot_start_refuses_what_it_cannot_do() [io]
+    test.assert_eq(lps22hb.oneshot_start(i2c(absent(1), 1)), -1)
+    let d = up(1)
+    test.assert_eq(lps22hb.oneshot_start(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }), -1)
+    // The release reads fail.
+    let c = chip_of(d)
+    c.deaf.insert(0x28, 1)
+    test.assert_eq(lps22hb.oneshot_start(d), -1)
+    c.deaf.insert(0x28, 0)
+    c.deaf.insert(0x2B, 1)
+    test.assert_eq(lps22hb.oneshot_start(d), -1)
+    c.deaf.insert(0x2B, 0)
+    // CTRL_REG2 cannot be read, or cannot be written.
+    c.deaf.insert(0x11, 1)
+    test.assert_eq(lps22hb.oneshot_start(d), -1)
+    c.deaf.insert(0x11, 0)
+    c.mute.insert(0x11, 1)
+    test.assert_eq(lps22hb.oneshot_start(d), -1)
+    c.mute.insert(0x11, 0)
+    c.deaf.insert(0x10, 1)
+    test.assert_eq(lps22hb.oneshot_start(d), -1)
+
+@test
+fn test_sample_oneshot_polls_at_most_the_bound() [io]
+    let d = up(2)
+    let c = chip_of(d)
+    c.st.insert(60, 3)
+    // Finishes within 10 polls.
+    let s = lps22hb.sample_oneshot(d, 10) ?? Lps22Sample { milli_pa: 0, milli_c: 0 }
+    test.assert_eq(s.milli_pa, 101325000)
+    // Three busy reads need four polls; three are not enough.
+    let e = up(2)
+    let ec = chip_of(e)
+    ec.st.insert(60, 3)
+    test.assert(lps22hb.sample_oneshot(e, 3) == None)
+    // A conversion that never finishes.
+    let n = up(1)
+    chip_of(n).st.insert(65, 1)
+    test.assert(lps22hb.sample_oneshot(n, 20) == None)
+    // A part running at a rate: the latest result, no wait.
+    let r = up(1)
+    test.assert(lps22hb.odr_set(r, 1))
+    convert(chip_of(r))
+    test.assert(lps22hb.sample_oneshot(r, 1) != None)
+    test.assert(lps22hb.sample_oneshot(i2c(absent(1), 1), 5) == None)
+
+@test
+fn test_the_traits_start_read_and_identify() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    c.st.insert(60, 1)
+    // The Barometer and Thermometer contract: the time, then the result.
+    let t = lps22hb.oneshot_start(d)
+    test.assert_eq(t, 14000)
+    test.assert(lps22hb.oneshot_done(d) == Some(false))
+    test.assert(lps22hb.oneshot_done(d) == Some(true))
+    test.assert((lps22hb.baro_read_of(d) ?? Pascals { pa: 0 }).pa == 101325)
+    // The device_probe default over the identity.
+    test.assert(lps22hb.id_read(d) != None)
+
+// ── The interrupt line ───────────────────────────────────────────────
+
+@test
+fn test_the_pad_level_and_stage_live_in_different_registers() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.irq_pad_set(d, true, false))
+    test.assert_eq(at(c.regs, 0x12) & 0xC0, 0x80)
+    test.assert(lps22hb.irq_pad_set(d, true, true))
+    test.assert_eq(at(c.regs, 0x12) & 0xC0, 0xC0)
+    test.assert(lps22hb.irq_pad_set(d, false, true))
+    test.assert_eq(at(c.regs, 0x12) & 0xC0, 0x40)
+    // The DRDY bit set by the bring-up stays.
+    test.assert_eq(at(c.regs, 0x12) & 0x04, 0x04)
+    let h = up(2)
+    let hc = chip_of(h)
+    test.assert(lps22hb.irq_pad_set(h, true, false))
+    test.assert_eq(at(hc.regs, 0x11) & 0x60, 0x40)
+    test.assert(lps22hb.irq_pad_set(h, true, true))
+    test.assert_eq(at(hc.regs, 0x11) & 0x60, 0x60)
+    test.assert(lps22hb.irq_pad_set(h, false, true))
+    test.assert_eq(at(hc.regs, 0x11) & 0x60, 0x20)
+    test.assert_eq(at(hc.regs, 0x12) & 0xC0, 0)
+    test.assert(not lps22hb.irq_pad_set(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, true, true))
+
+@test
+fn test_the_pad_shows_what_int_s_selects() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    for sel in 0..4
+        test.assert(lps22hb.irq_source_set(d, sel))
+        test.assert_eq(at(c.regs, 0x12) & 0x03, sel)
+    test.assert(not lps22hb.irq_source_set(d, 4))
+    test.assert(not lps22hb.irq_source_set(d, -1))
+    test.assert(lps22hb.drdy_irq(d, false))
+    test.assert_eq(at(c.regs, 0x12) & 0x04, 0)
+    test.assert(lps22hb.drdy_irq(d, true))
+    test.assert_eq(at(c.regs, 0x12) & 0x04, 0x04)
+    test.assert(lps22hb.fifo_irq(d, true, false, true))
+    test.assert_eq(at(c.regs, 0x12) & 0x38, 0x28)
+    test.assert(lps22hb.fifo_irq(d, false, true, false))
+    test.assert_eq(at(c.regs, 0x12) & 0x38, 0x10)
+    test.assert(lps22hb.fifo_irq(d, false, false, false))
+    test.assert_eq(at(c.regs, 0x12) & 0x38, 0)
+
+@test
+fn test_the_threshold_is_two_registers_and_the_lps22hh_holds_15_bits() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert_eq(lps22hb.threshold_set(d, 100000), 100000)
+    test.assert_eq(at(c.regs, 0x0C), 16000 & 0xFF)
+    test.assert_eq(at(c.regs, 0x0D), 16000 >> 8)
+    test.assert_eq(lps22hb.threshold_get(d), 100000)
+    // Held to 16 bits.
+    test.assert_eq(lps22hb.threshold_set(d, 100000000), lps22hb.threshold_pa(0xFFFF))
+    let h = up(2)
+    let hc = chip_of(h)
+    test.assert_eq(lps22hb.threshold_set(h, 100000000), lps22hb.threshold_pa(0x7FFF))
+    test.assert_eq(at(hc.regs, 0x0D), 0x7F)
+    // The unused bit 7 of THS_P_H is not read as data.
+    hc.regs.insert(0x0D, 0xFF)
+    test.assert_eq(lps22hb.threshold_get(h), lps22hb.threshold_pa(0x7FFF))
+    test.assert_eq(lps22hb.threshold_set(i2c(absent(1), 1), 5), -1)
+    test.assert_eq(lps22hb.threshold_set(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, 5), -1)
+    test.assert_eq(lps22hb.threshold_get(i2c(absent(1), 1)), -1)
+    // A second register that refuses a write.
+    c.mute.insert(0x0D, 1)
+    test.assert_eq(lps22hb.threshold_set(d, 5), -1)
+
+@test
+fn test_the_threshold_interrupt_sets_diff_en_the_events_and_the_route() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.threshold_irq(d, true, false, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0x09)
+    test.assert_eq(at(c.regs, 0x12) & 0x03, 1)
+    test.assert(lps22hb.threshold_irq(d, false, true, true))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0x0E)
+    test.assert_eq(at(c.regs, 0x12) & 0x03, 2)
+    test.assert(lps22hb.threshold_irq(d, true, true, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0x0B)
+    test.assert_eq(at(c.regs, 0x12) & 0x03, 3)
+    // Neither: the generator is off and the data signals are back.
+    test.assert(lps22hb.threshold_irq(d, false, false, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0)
+    test.assert_eq(at(c.regs, 0x12) & 0x03, 0)
+    // The upper bits of INTERRUPT_CFG are not touched (the lps22hb crate
+    // overwrote them).
+    c.regs.insert(0x0B, 0xA0)
+    test.assert(lps22hb.threshold_irq(d, true, false, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0xF0, 0xA0)
+    c.mute.insert(0x0B, 1)
+    test.assert(not lps22hb.threshold_irq(d, true, false, false))
+
+@test
+fn test_int_source_is_read_where_the_part_keeps_it() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        c.st.insert(89, 0x05)
+        test.assert_eq(lps22hb.int_source(d), 0x05)
+        // A latched event is gone once read.
+        test.assert_eq(lps22hb.int_source(d), 0)
+    test.assert_eq(lps22hb.int_source(i2c(absent(1), 1)), -1)
+    test.assert_eq(lps22hb.int_source(I2cDut { bus: up(1).bus, pins: pins(chip(1)), w: WI, fam: 0 }), -1)
+
+// ── The reference pressure and the offset ────────────────────────────
+
+@test
+fn test_autozero_and_autorefp_set_and_reset_their_bits() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.autozero(d, true))
+    test.assert_eq(at(c.regs, 0x0B) & 0x30, 0x20)
+    test.assert(lps22hb.autozero(d, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0x10, 0x10)
+    test.assert(lps22hb.autorefp(d, true))
+    test.assert_eq(at(c.regs, 0x0B) & 0xC0, 0x80)
+    test.assert(lps22hb.autorefp(d, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0x40, 0x40)
+
+@test
+fn test_the_reference_is_signed_24_bits_or_signed_16_bits() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    c.regs.insert(0x15, 0x00)
+    c.regs.insert(0x16, 0x00)
+    c.regs.insert(0x17, 0xFF)
+    test.assert_eq(lps22hb.ref_read(d) ?? 0, -65536)
+    c.regs.insert(0x17, 0x01)
+    test.assert_eq(lps22hb.ref_read(d) ?? 0, 65536)
+    let h = up(2)
+    let hc = chip_of(h)
+    hc.regs.insert(0x15, 0x00)
+    hc.regs.insert(0x16, 0x80)
+    test.assert_eq(lps22hb.ref_read(h) ?? 0, -32768)
+    test.assert(lps22hb.ref_read(i2c(absent(1), 1)) == None)
+    test.assert(lps22hb.ref_read(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }) == None)
+
+@test
+fn test_the_offset_is_a_signed_16_bit_count() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.offset_set(d, -2))
+    test.assert_eq(at(c.regs, 0x18), 0xFE)
+    test.assert_eq(at(c.regs, 0x19), 0xFF)
+    test.assert_eq(lps22hb.offset_get(d) ?? 0, -2)
+    test.assert(lps22hb.offset_set(d, 1000))
+    test.assert_eq(lps22hb.offset_get(d) ?? 0, 1000)
+    test.assert(not lps22hb.offset_set(d, 32768))
+    test.assert(not lps22hb.offset_set(d, -32769))
+    test.assert(lps22hb.offset_get(i2c(absent(1), 1)) == None)
+    c.mute.insert(0x19, 1)
+    test.assert(not lps22hb.offset_set(d, 5))
+    c.mute.insert(0x19, 0)
+    c.mute.insert(0x18, 1)
+    test.assert(not lps22hb.offset_set(d, 5))
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_fifo_mode_and_watermark_go_to_each_part_s_registers() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    // The LPS22HB: FIFO_EN in CTRL_REG2, mode in bits 7:5 of 0x14.
+    test.assert(lps22hb.fifo_set(d, 2, 10))
+    test.assert_eq(at(c.regs, 0x14), (2 << 5) | 10)
+    test.assert_eq(at(c.regs, 0x11) & 0x40, 0x40)
+    test.assert(lps22hb.fifo_set(d, 6, 31))
+    test.assert_eq(at(c.regs, 0x14), (7 << 5) | 31)
+    test.assert(lps22hb.fifo_set(d, 0, 0))
+    test.assert_eq(at(c.regs, 0x14), 0)
+    test.assert_eq(at(c.regs, 0x11) & 0x40, 0)
+    test.assert(not lps22hb.fifo_set(d, 1, 32))
+    test.assert(not lps22hb.fifo_set(d, 1, -1))
+    test.assert(not lps22hb.fifo_set(d, 9, 1))
+    // The LPS22HH: the mode in 0x13, the watermark in 0x14, no enable.
+    let h = up(2)
+    let hc = chip_of(h)
+    test.assert(lps22hb.fifo_set(h, 2, 100))
+    test.assert_eq(at(hc.regs, 0x13), 2)
+    test.assert_eq(at(hc.regs, 0x14), 100)
+    test.assert(lps22hb.fifo_set(h, 6, 127))
+    test.assert_eq(at(hc.regs, 0x13), 5)
+    test.assert(not lps22hb.fifo_set(h, 1, 128))
+    test.assert(not lps22hb.fifo_set(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, 1, 1))
+    // A watermark write that is refused.
+    hc.mute.insert(0x14, 1)
+    test.assert(not lps22hb.fifo_set(h, 1, 3))
+    c.mute.insert(0x11, 1)
+    test.assert(not lps22hb.fifo_set(d, 1, 3))
+    c.mute.insert(0x11, 0)
+    c.mute.insert(0x14, 1)
+    test.assert(not lps22hb.fifo_set(d, 1, 3))
+
+@test
+fn test_the_fifo_level_and_flags_are_read_from_each_part_s_registers() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.fifo_set(d, 2, 3))
+    test.assert_eq(lps22hb.fifo_level(d), 0)
+    test.assert_eq(lps22hb.fifo_flags(d), 0)
+    for i in 0..3
+        fifo_put(c, 100 * (i + 1), 10 * (i + 1))
+    test.assert_eq(lps22hb.fifo_level(d), 3)
+    // The watermark is reached.
+    test.assert_eq(lps22hb.fifo_flags(d), 1)
+    c.st.insert(90, 1)
+    test.assert_eq(lps22hb.fifo_flags(d), 3)
+    // 32 samples: full.
+    for i in 0..29
+        fifo_put(c, i, i)
+    test.assert_eq(lps22hb.fifo_level(d), 32)
+    test.assert_eq(lps22hb.fifo_flags(d), 7)
+    let h = up(2)
+    let hc = chip_of(h)
+    test.assert(lps22hb.fifo_set(h, 2, 3))
+    test.assert_eq(lps22hb.fifo_flags(h), 0)
+    for i in 0..3
+        fifo_put(hc, i, i)
+    test.assert_eq(lps22hb.fifo_level(h), 3)
+    test.assert_eq(lps22hb.fifo_flags(h), 1)
+    hc.st.insert(90, 1)
+    test.assert_eq(lps22hb.fifo_flags(h), 3)
+    for i in 0..125
+        fifo_put(hc, i, i)
+    test.assert_eq(lps22hb.fifo_level(h), 128)
+    test.assert_eq(lps22hb.fifo_flags(h), 7)
+    test.assert_eq(lps22hb.fifo_level(i2c(absent(1), 1)), -1)
+    test.assert_eq(lps22hb.fifo_flags(i2c(absent(1), 1)), -1)
+    test.assert_eq(lps22hb.fifo_flags(i2c(absent(2), 2)), -1)
+    let n = I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }
+    test.assert_eq(lps22hb.fifo_level(n), -1)
+    test.assert_eq(lps22hb.fifo_flags(n), -1)
+
+@test
+fn test_a_fifo_is_drained_oldest_first_into_milli_units() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        test.assert(lps22hb.fifo_set(d, 2, 5))
+        fifo_put(c, 4150272, 2500)
+        fifo_put(c, 4154368, 2600)
+        fifo_put(c, 0xF9A000, 0xF830)
+        var press: Lps22Samples = Vec.new()
+        var temp: Lps22Samples = Vec.new()
+        test.assert_eq(lps22hb.fifo_take(d, var press, var temp), 3)
+        test.assert_eq(press.len(), 3)
+        test.assert_eq(press[0], 101325000)
+        test.assert_eq(press[1], 101425000)
+        test.assert_eq(press[2], lps22hb.pressure_mpa(0xF9A000))
+        test.assert_eq(temp[0], 25000)
+        test.assert_eq(temp[1], 26000)
+        test.assert_eq(temp[2], -20000)
+        // Emptied: nothing more, and the lists were emptied first.
+        test.assert_eq(lps22hb.fifo_take(d, var press, var temp), 0)
+        test.assert_eq(press.len(), 0)
+
+@test
+fn test_a_deep_fifo_is_drained_in_pieces_of_32() [io]
+    let d = up(2)
+    let c = chip_of(d)
+    test.assert(lps22hb.fifo_set(d, 2, 5))
+    for i in 0..40
+        fifo_put(c, 4096 * (i + 1), i)
+    var press: Lps22Samples = Vec.new()
+    var temp: Lps22Samples = Vec.new()
+    test.assert_eq(lps22hb.fifo_take(d, var press, var temp), 32)
+    test.assert_eq(press[31], 3200000)
+    test.assert_eq(lps22hb.fifo_take(d, var press, var temp), 8)
+    test.assert_eq(press[0], 3300000)
+    test.assert_eq(temp[7], 390)
+
+@test
+fn test_the_fifo_read_failures_are_reported() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    test.assert(lps22hb.fifo_set(d, 2, 5))
+    fifo_put(c, 4096, 1)
+    var press: Lps22Samples = Vec.new()
+    var temp: Lps22Samples = Vec.new()
+    c.deaf.insert(0x28, 1)
+    test.assert_eq(lps22hb.fifo_take(d, var press, var temp), -1)
+    test.assert_eq(lps22hb.fifo_take(i2c(absent(1), 1), var press, var temp), -1)
+
+// ── The awaitable data-ready line ────────────────────────────────────
+
+// A pin-edge source that records the pin and the edge it was armed on.
+struct FakeEdge
+    seen: HashMap<Int, Int>
+    refuse: Int
+
+impl AsyncEdge[] for FakeEdge
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int
+        if self.refuse == 1
+            return -2
+        self.seen.insert(pin, edge)
+        0
+
+    fn edge_disarm(self, pin: Int) -> Bool
+        self.seen.insert(pin + 1000, 1)
+        true
+
+    fn edge_irqs(self) -> Int
+        0
+
+@test
+fn test_the_data_ready_line_is_armed_on_its_pin_for_a_rising_edge() [io, async]
+    let f = core.rt.future_new()
+    let e = FakeEdge { seen: HashMap.new(), refuse: 0 }
+    test.assert_eq(lps22hb.drdy_arm(e, WI, f), 0)
+    test.assert_eq(at(e.seen, 7), 0)
+    test.assert(lps22hb.drdy_disarm(e, WI))
+    test.assert_eq(at(e.seen, 1007), 1)
+    // A wiring with no interrupt pin arms nothing.
+    test.assert_eq(lps22hb.drdy_arm(e, dev_bus.wiring_i2c(0, 0x5C), f), -1)
+    test.assert(not lps22hb.drdy_disarm(e, dev_bus.wiring_i2c(0, 0x5C)))
+    // A source that refuses.
+    test.assert_eq(lps22hb.drdy_arm(FakeEdge { seen: HashMap.new(), refuse: 1 }, WI, f), -2)
+    core.rt.future_drop(f)
+
+// ── The host scheduler's async form ──────────────────────────────────
+
+@test
+fn test_the_async_form_parks_then_answers_the_result() [io, hw, time, async]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        c.st.insert(60, 2)
+        let h = lps22hb.host_of(d)
+        let p = await h.baro_measure()
+        test.assert_eq((p ?? Pascals { pa: 0 }).pa, 101325)
+        let e = up(fam)
+        chip_of(e).st.insert(60, 1)
+        let g = lps22hb.host_of(e)
+        let t = await g.temp_measure()
+        test.assert_eq((t ?? TempMilliC { milli_c: 0 }).milli_c, 25000)
+
+@test
+fn test_the_async_form_answers_none_for_a_part_that_does_not_answer() [io, hw, time, async]
+    let a = lps22hb.host_of(i2c(absent(1), 1))
+    test.assert(await a.baro_measure() == None)
+    test.assert(await a.temp_measure() == None)
+    // A running part: no wait, the latest result.
+    let d = up(1)
+    test.assert(lps22hb.odr_set(d, 1))
+    convert(chip_of(d))
+    let r = lps22hb.host_of(d)
+    test.assert(await r.baro_measure() != None)
+    convert(chip_of(d))
+    test.assert(await r.temp_measure() != None)
+    // A conversion that never finishes still answers, after the polls.
+    let n = up(1)
+    chip_of(n).st.insert(65, 1)
+    let w = lps22hb.host_of(n)
+    test.assert(await w.baro_measure() == None)
+
+// ── The part on a board's handles ────────────────────────────────────
+
+@test
+fn test_the_types_over_the_host_s_board_handles_answer_as_absent_hardware() [io]
+    // The host's board handles drive no hardware: every read fails, and the
+    // methods answer as for a part that does not acknowledge.
+    var a = Lps22.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, WI)
+    test.assert(not a.begin())
+    test.assert_eq(a.family_in_use(), 0)
+    let a2 = a.with_family(1)
+    test.assert_eq(a2.family_in_use(), 1)
+    test.assert(a2.reg(0x0F) == None)
+    test.assert(not a2.set_reg(0x10, 1))
+    test.assert(a2.sample() == None)
+    test.assert(a2.sample_once(2) == None)
+    test.assert(not a2.ready())
+    test.assert(not a2.set_rate(1))
+    test.assert(not a2.set_filter(1))
+    test.assert(not a2.set_fifo(1, 1))
+    var press: Lps22Samples = Vec.new()
+    var temp: Lps22Samples = Vec.new()
+    test.assert_eq(a2.fifo_drain(var press, var temp), -1)
+    test.assert_eq(a2.set_threshold(10), -1)
+    test.assert(not a2.threshold_interrupt(true, false, false))
+    test.assert_eq(a2.interrupt_source(), -1)
+    test.assert_eq(a2.irq(), 0)
+    test.assert_eq(a2.baro_start(), -1)
+    test.assert(a2.baro_read() == None)
+    test.assert_eq(a2.temp_start(), -1)
+    test.assert(a2.temp_read() == None)
+    test.assert(a2.device_id() == None)
+    test.assert(not a2.device_probe(0xB1))
+    // The host's SPI handle reads the bytes of an idle bus, 0xFF, and the
+    // part is not identified by them.
+    var s = Lps22Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, WS)
+    test.assert(not s.begin())
+    test.assert_eq(s.family_in_use(), 0)
+    let s2 = s.with_family(2)
+    test.assert_eq(s2.family_in_use(), 2)
+    let _ = s2.reg(0x0F)
+    test.assert(not s2.set_reg(0x10, 1))
+    test.assert(s2.device_id() == None)
+    let _ = s2.sample()
+    let _ = s2.sample_once(2)
+    let _ = s2.ready()
+    let _ = s2.set_rate(1)
+    let _ = s2.set_filter(1)
+    let _ = s2.set_fifo(1, 1)
+    let _ = s2.fifo_drain(var press, var temp)
+    let _ = s2.set_threshold(10)
+    let _ = s2.threshold_interrupt(true, false, false)
+    let _ = s2.interrupt_source()
+    test.assert_eq(s2.irq(), 0)
+    let _ = s2.baro_start()
+    let _ = s2.baro_read()
+    let _ = s2.temp_start()
+    let _ = s2.temp_read()

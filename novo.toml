@@ -1,0 +1,24 @@
+[package]
+name        = "lps22hb-nv"
+version     = "0.1.0"
+description = "A driver for ST's LPS22HB and LPS22HH absolute pressure sensors on an I2C or an SPI bus: pressure in pascals and temperature in millidegrees Celsius from the 24-bit and 16-bit counts, the output data rate, the low-pass filter and block data update, the one-shot conversion with its ready flag, the FIFO modes, the reference pressure, the pressure thresholds and the interrupt line, and the family switch on WHO_AM_I, as devices-nv's Barometer, Thermometer and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["lps22hb", "lps22hh", "barometer", "pressure", "thermometer", "i2c", "spi", "sensor", "st", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/lps22hb-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+[docs.pages]
+"README.md" = "Reading an LPS22HB or LPS22HH pressure sensor from a device program"
+
+[dependencies]
+# The board's I2C bus, SPI bus and GPIO handles, the I2cBus, SpiBus and
+# GpioOut traits they implement, and the pin-edge trait of the awaitable
+# data-ready line.
+embedded-hal-nv = "^0.3.3"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the Barometer, Thermometer and Identifiable traits.
+devices-nv      = "^0.3.3"
