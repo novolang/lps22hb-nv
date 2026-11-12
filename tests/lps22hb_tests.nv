@@ -1304,6 +1304,134 @@ fn test_the_fifo_read_failures_are_reported() [io]
     test.assert_eq(lps22hb.fifo_take(d, var press, var temp), -1)
     test.assert_eq(lps22hb.fifo_take(i2c(absent(1), 1), var press, var temp), -1)
 
+@test
+fn test_the_barometer_fifo_count_is_the_samples_in_it_and_0_for_no_answer() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        test.assert(lps22hb.fifo_set(d, 2, 5))
+        test.assert_eq(lps22hb.baro_fifo_count_of(d), 0)
+        fifo_put(c, 4150272, 2500)
+        fifo_put(c, 4154368, 2600)
+        test.assert_eq(lps22hb.baro_fifo_count_of(d), 2)
+    test.assert_eq(lps22hb.baro_fifo_count_of(i2c(absent(1), 1)), 0)
+    let d = up(1)
+    test.assert_eq(lps22hb.baro_fifo_count_of(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }), 0)
+
+@test
+fn test_the_barometer_fifo_is_read_oldest_first_in_pascals() [io]
+    for fam in [1, 2]
+        let d = up(fam)
+        let c = chip_of(d)
+        test.assert(lps22hb.fifo_set(d, 2, 5))
+        fifo_put(c, 4150272, 2500)
+        fifo_put(c, 4154368, 2600)
+        fifo_put(c, 0xF9A000, 0xF830)
+        var dst: Vec[Pascals; 32] = Vec.new()
+        // A list that held something is emptied first.
+        let _ = dst.push(Pascals { pa: 7 })
+        test.assert_eq(lps22hb.baro_fifo_read_of(d, var dst), 3)
+        test.assert_eq(dst.len(), 3)
+        test.assert_eq(dst[0].pa, 101325)
+        test.assert_eq(dst[1].pa, 101425)
+        test.assert_eq(dst[2].pa, lps22hb.pressure_pa(0xF9A000))
+        test.assert_eq(lps22hb.baro_fifo_read_of(d, var dst), 0)
+        test.assert_eq(dst.len(), 0)
+
+@test
+fn test_a_deep_barometer_fifo_is_read_in_pieces_of_32_and_a_failure_moves_nothing() [io]
+    let d = up(2)
+    let c = chip_of(d)
+    test.assert(lps22hb.fifo_set(d, 2, 5))
+    for i in 0..40
+        fifo_put(c, 4096 * (i + 1), i)
+    var dst: Vec[Pascals; 32] = Vec.new()
+    test.assert_eq(lps22hb.baro_fifo_read_of(d, var dst), 32)
+    test.assert_eq(dst[31].pa, 3200)
+    test.assert_eq(lps22hb.baro_fifo_read_of(d, var dst), 8)
+    test.assert_eq(dst[0].pa, 3300)
+    // The samples cannot be read: the list is emptied and nothing moved.
+    let e = up(1)
+    let ec = chip_of(e)
+    test.assert(lps22hb.fifo_set(e, 2, 5))
+    fifo_put(ec, 4096, 1)
+    let _ = dst.push(Pascals { pa: 7 })
+    ec.deaf.insert(0x28, 1)
+    test.assert_eq(lps22hb.baro_fifo_read_of(e, var dst), 0)
+    test.assert_eq(dst.len(), 0)
+    // The level cannot be read, or the family is not known.
+    test.assert_eq(lps22hb.baro_fifo_read_of(i2c(absent(1), 1), var dst), 0)
+    test.assert_eq(lps22hb.baro_fifo_read_of(I2cDut { bus: e.bus, pins: e.pins, w: e.w, fam: 0 }, var dst), 0)
+
+@test
+fn test_the_reference_pressure_is_ref_p_in_counts_of_1_4096_hpa() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    // 101325 Pa is 4150272 counts, 0x3F5400.
+    test.assert(lps22hb.baro_set_reference_of(d, Pascals { pa: 101325 }))
+    test.assert_eq(at(c.regs, 0x15), 0x00)
+    test.assert_eq(at(c.regs, 0x16), 0x54)
+    test.assert_eq(at(c.regs, 0x17), 0x3F)
+    test.assert_eq(lps22hb.ref_read(d) ?? 0, 4150272)
+    // A negative reference is two's complement: -100 Pa is -4096 counts.
+    test.assert(lps22hb.baro_set_reference_of(d, Pascals { pa: -100 }))
+    test.assert_eq(lps22hb.ref_read(d) ?? 0, -4096)
+    // The register holds 24 bits signed: 2048 hPa is one past the top.
+    test.assert(lps22hb.baro_set_reference_of(d, Pascals { pa: 204799 }))
+    test.assert(not lps22hb.baro_set_reference_of(d, Pascals { pa: 204800 }))
+    test.assert(not lps22hb.baro_set_reference_of(d, Pascals { pa: -204801 }))
+    test.assert(lps22hb.baro_set_reference_of(d, Pascals { pa: -204800 }))
+    // The LPS22HH's register has a scale that is not known here, and an
+    // unknown family and an absent part have none.
+    let h = up(2)
+    test.assert(not lps22hb.baro_set_reference_of(h, Pascals { pa: 101325 }))
+    test.assert(not lps22hb.baro_set_reference_of(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, Pascals { pa: 101325 }))
+    test.assert(not lps22hb.baro_set_reference_of(i2c(absent(1), 1), Pascals { pa: 101325 }))
+    // Each of the three bytes is held.
+    c.mute.insert(0x16, 1)
+    test.assert(not lps22hb.baro_set_reference_of(d, Pascals { pa: 101325 }))
+    c.mute.insert(0x16, 0)
+    c.mute.insert(0x17, 1)
+    test.assert(not lps22hb.baro_set_reference_of(d, Pascals { pa: 101325 }))
+
+@test
+fn test_the_barometer_threshold_is_ths_p_with_the_events_and_not_latched() [io]
+    let d = up(1)
+    let c = chip_of(d)
+    // 1000 hPa is 16000 steps of 6.25 Pa; above it.
+    test.assert(lps22hb.baro_set_threshold_of(d, Pascals { pa: 100000 }, true, false))
+    test.assert_eq(at(c.regs, 0x0C), 16000 & 0xFF)
+    test.assert_eq(at(c.regs, 0x0D), 16000 >> 8)
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0x09)
+    test.assert_eq(at(c.regs, 0x12) & 0x03, 1)
+    // Below it, then either.
+    test.assert(lps22hb.baro_set_threshold_of(d, Pascals { pa: 100000 }, false, true))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0x0A)
+    test.assert_eq(at(c.regs, 0x12) & 0x03, 2)
+    test.assert(lps22hb.baro_set_threshold_of(d, Pascals { pa: 100000 }, true, true))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0x0B)
+    // To the nearest step: 100003 Pa is 16000.48 steps.
+    test.assert(lps22hb.baro_set_threshold_of(d, Pascals { pa: 100003 }, true, false))
+    test.assert_eq(lps22hb.threshold_get(d), 100000)
+    // Neither event: the interrupt is off, the threshold is written.
+    test.assert(lps22hb.baro_set_threshold_of(d, Pascals { pa: 90000 }, false, false))
+    test.assert_eq(at(c.regs, 0x0B) & 0x0F, 0)
+    test.assert_eq(lps22hb.threshold_get(d), 90000)
+    // A negative pressure, and one past the register: 409600 Pa is 65536
+    // steps, one more than the LPS22HB holds and twice the LPS22HH's.
+    log_clear(c)
+    test.assert(not lps22hb.baro_set_threshold_of(d, Pascals { pa: -1 }, true, false))
+    test.assert(not lps22hb.baro_set_threshold_of(d, Pascals { pa: 409600 }, true, false))
+    test.assert_eq(at(c.st, 99), 0)
+    let h = up(2)
+    test.assert(lps22hb.baro_set_threshold_of(h, Pascals { pa: 204793 }, true, false))
+    test.assert(not lps22hb.baro_set_threshold_of(h, Pascals { pa: 204800 }, true, false))
+    // An unknown family, an absent part and a register that is held.
+    test.assert(not lps22hb.baro_set_threshold_of(I2cDut { bus: d.bus, pins: d.pins, w: d.w, fam: 0 }, Pascals { pa: 100000 }, true, false))
+    test.assert(not lps22hb.baro_set_threshold_of(i2c(absent(1), 1), Pascals { pa: 100000 }, true, false))
+    c.mute.insert(0x0B, 1)
+    test.assert(not lps22hb.baro_set_threshold_of(d, Pascals { pa: 100000 }, true, false))
+
 // ── The awaitable data-ready line ────────────────────────────────────
 
 // A pin-edge source that records the pin and the edge it was armed on.
@@ -1395,11 +1523,11 @@ fn test_the_types_over_the_host_s_board_handles_answer_as_absent_hardware() [io]
     test.assert(not a2.set_rate(1))
     test.assert(not a2.set_filter(1))
     test.assert(not a2.set_fifo(1, 1))
-    var press: Lps22Samples = Vec.new()
-    var temp: Lps22Samples = Vec.new()
-    test.assert_eq(a2.fifo_drain(var press, var temp), -1)
-    test.assert_eq(a2.set_threshold(10), -1)
-    test.assert(not a2.threshold_interrupt(true, false, false))
+    var dst: Vec[Pascals; 32] = Vec.new()
+    test.assert_eq(a2.baro_fifo_count(), 0)
+    test.assert_eq(a2.baro_fifo_read(var dst), 0)
+    test.assert(not a2.baro_set_reference(Pascals { pa: 101325 }))
+    test.assert(not a2.baro_set_threshold(Pascals { pa: 100000 }, true, false))
     test.assert_eq(a2.interrupt_source(), -1)
     test.assert_eq(a2.irq(), 0)
     test.assert_eq(a2.baro_start(), -1)
@@ -1424,9 +1552,10 @@ fn test_the_types_over_the_host_s_board_handles_answer_as_absent_hardware() [io]
     let _ = s2.set_rate(1)
     let _ = s2.set_filter(1)
     let _ = s2.set_fifo(1, 1)
-    let _ = s2.fifo_drain(var press, var temp)
-    let _ = s2.set_threshold(10)
-    let _ = s2.threshold_interrupt(true, false, false)
+    let _ = s2.baro_fifo_count()
+    let _ = s2.baro_fifo_read(var dst)
+    let _ = s2.baro_set_reference(Pascals { pa: 101325 })
+    let _ = s2.baro_set_threshold(Pascals { pa: 100000 }, true, false)
     let _ = s2.interrupt_source()
     test.assert_eq(s2.irq(), 0)
     let _ = s2.baro_start()

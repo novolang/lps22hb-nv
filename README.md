@@ -194,8 +194,11 @@ chip and does not call `begin` names the map with `with_family(FAM_HB)` or
 | `ready()` | both result flags of STATUS |
 | `device_id()` | `Identifiable`: WHO_AM_I |
 | `set_rate(code)`, `set_filter(mode)` | the output data rate code, 0 to 5 (to 7), and the low-pass filter off, ODR/9 or ODR/20 |
-| `set_fifo(mode, wtm)`, `fifo_drain(press, temp)` | the FIFO mode and watermark, and the samples out of it |
-| `set_threshold(pa)`, `threshold_interrupt(high, low, latched)`, `interrupt_source()` | the pressure threshold and its interrupt |
+| `set_fifo(mode, wtm)` | the FIFO mode and watermark |
+| `baro_fifo_count()`, `baro_fifo_read(dst)` | `Barometer`: the samples in the FIFO, and up to 32 of them, oldest first, as pascals in a `Vec[Pascals; 32]` |
+| `baro_set_reference(p)` | `Barometer`: the pressure into REF_P, on the LPS22HB; `false` on the LPS22HH |
+| `baro_set_threshold(p, on_high, on_low)` | `Barometer`: THS_P to the nearest step of 6.25 Pa and the interrupt on PHE and PLE, not latched |
+| `interrupt_source()` | INT_SOURCE; reading it clears a latched event |
 | `reg(r)`, `set_reg(r, v)` | one register, and a write that is read back |
 | `irq()` | the level of the INT_DRDY line, -1 for a wiring with none |
 
@@ -237,9 +240,12 @@ The FIFO is an option: `begin` leaves it off.  `set_fifo(mode, wtm)` takes
 a mode of this package (`FIFO_BYPASS`, `FIFO_FIFO`, `FIFO_STREAM`,
 `FIFO_DYNAMIC`, `FIFO_STREAM_TO_FIFO`, `FIFO_BYPASS_TO_STREAM`,
 `FIFO_BYPASS_TO_FIFO`) and writes the code of the part's own table.
-`fifo_drain` takes up to 32 samples, oldest first, into two lists, the
-pressures in millipascals and the temperatures in millidegrees, and
-answers how many it took.  A sample is five bytes read in one burst.  The
+`baro_fifo_read` takes up to 32 samples, oldest first, into a
+`Vec[Pascals; 32]` and answers how many it took; `baro_fifo_count` answers
+how many are waiting.  A program that wants the temperatures as well, or the
+samples in millipascals, calls `fifo_take(part, press, temp)`, which takes a
+port and so takes `Lps22` and `Lps22Spi` too.  A sample is five bytes read in
+one burst.  The
 data sheet asks the host to discard the first sample after the mode
 changes; the driver does not, and says so at `fifo_set`.
 
@@ -248,8 +254,9 @@ changes; the driver does not, and says so at `fifo_set`.
 `drdy_irq` puts the data-ready signal on the INT_DRDY pad, and `begin`
 does.  The pad shows what INT_S selects: the data signals, a pressure
 above the threshold, below it, or either (`irq_source_set`,
-`threshold_irq`).  A latched threshold event stays in INT_SOURCE until
-`int_source` reads it.  `irq_pad_set` sets the active level and the output
+`threshold_irq`).  `baro_set_threshold` sets the threshold and the two
+events without a latch; `threshold_irq(part, high, low, true)` latches, and a
+latched threshold event stays in INT_SOURCE until `int_source` reads it.  `irq_pad_set` sets the active level and the output
 stage, in the register each part keeps them in.
 
 ## Async forms
@@ -310,6 +317,8 @@ its impls are `@tier(app)`, since the embedded tier refuses an `async fn`.
   Zephyr's, not the data sheet's.  NOT IMPLEMENTED as read from that
   document.
 - An altitude, and a sea-level pressure.
+- A reference pressure on the LPS22HH: its REF_P is 16 bits, and the scale
+  is not in the sources read, so `baro_set_reference` answers `false`.
 - The FIFO full flag as an interrupt with its own latch; `fifo_irq` puts
   the three FIFO signals on the pad.
 

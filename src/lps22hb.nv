@@ -418,14 +418,18 @@ pub fn temp_milli_c(raw: Int) -> Int
 // 16 bits (15 on the LPS22HH).
 pub fn threshold_code(pa: Int, fam: Int) -> Int
     var c = round_div(pa * 4, 25)
-    var top = 0xFFFF
-    if fam == FAM_HH
-        top = 0x7FFF
+    let top = threshold_top(fam)
     if c > top
         c = top
     if c < 0
         c = 0
     c
+
+// The largest value of the threshold register: 16 bits, 15 on the LPS22HH.
+fn threshold_top(fam: Int) -> Int
+    if fam == FAM_HH
+        return 0x7FFF
+    0xFFFF
 
 // The pressure in pascals a threshold register's value means.
 pub fn threshold_pa(code: Int) -> Int
@@ -895,6 +899,39 @@ pub fn offset_get<P: Lps22Port>(p: P) -> ?Int [hw]
         return None
     Some(dev_bus.dev_sign_extend((b[1] as Int << 8) | b[0] as Int, 16))
 
+// `Barometer.baro_set_reference`: writes the pressure, to the nearest of
+// 1/4096 hPa, into REF_P (0x15 to 0x17, 24 bits signed), which the part
+// compares the threshold interrupt against (datasheet 9.9).  Only the LPS22HB:
+// the scale of the LPS22HH's 16-bit REF_P is not in the sources read, so
+// that part, a family not known and a pressure outside +-2048 hPa are
+// refused.  The output pressure is not subtracted by this; that is
+// `autozero`.  Whether the part holds the value.
+pub fn baro_set_reference_of<P: Lps22Port>(p: P, pa: Pascals) -> Bool [hw]
+    if p.family() != FAM_HB
+        return false
+    let counts = round_div(pa.pa * 1024, 25)
+    if counts < -8388608 or counts > 8388607
+        return false
+    if not reg_write(p, 0x15, counts & 0xFF)
+        return false
+    if not reg_write(p, 0x16, (counts >> 8) & 0xFF)
+        return false
+    reg_write(p, 0x17, (counts >> 16) & 0xFF)
+
+// `Barometer.baro_set_threshold`: THS_P to the pressure, to the nearest step
+// of 6.25 Pa, and the interrupt for `on_high` (PHE) and `on_low` (PLE),
+// routed to the pad and not latched; with neither the interrupt is off.  A
+// negative pressure, one past the register's range and a family not known
+// are refused.  Whether the part took it.  `threshold_irq` latches.
+pub fn baro_set_threshold_of<P: Lps22Port>(p: P, pa: Pascals, on_high: Bool,
+                                           on_low: Bool) -> Bool [hw]
+    let fam = p.family()
+    if fam == FAM_NONE or pa.pa < 0 or round_div(pa.pa * 4, 25) > threshold_top(fam)
+        return false
+    if threshold_set(p, pa.pa) < 0
+        return false
+    threshold_irq(p, on_high, on_low, false)
+
 // ── The FIFO ─────────────────────────────────────────────────────────
 
 // Sets the FIFO mode (`FIFO_*`) and the watermark, 0 to 31 on the
@@ -967,24 +1004,67 @@ pub fn fifo_flags<P: Lps22Port>(p: P) -> Int [hw]
 pub fn fifo_take<P: Lps22Port>(p: P, var press: Lps22Samples, var temp: Lps22Samples) -> Int [hw]
     press.clear()
     temp.clear()
-    let fam = p.family()
     let n = fifo_level(p)
     if n < 0
         return -1
-    var first = PRESS_OUT_XL
-    if fam == FAM_HH
-        first = FIFO_OUT_HH
+    let first = fifo_first(p.family())
     var taken = 0
     for _i in 0..n
         if taken >= 32
             break
-        var b: DevBytes = Vec.new()
-        if not p.read_regs(first, 5, var b)
-            return -1
-        let rp = dev_bus.dev_sign_extend((b[2] as Int << 16) | (b[1] as Int << 8) | b[0] as Int, 24)
-        let rt = dev_bus.dev_sign_extend((b[4] as Int << 8) | b[3] as Int, 16)
-        let _ = press.push(pressure_mpa(rp))
-        let _ = temp.push(temp_milli_c(rt))
+        let Some(s) = fifo_sample(p, first) else return -1
+        let _ = press.push(pressure_mpa(s.rp))
+        let _ = temp.push(temp_milli_c(s.rt))
+        taken = taken + 1
+    taken
+
+// The register a FIFO sample is read from: the output registers on the
+// LPS22HB, which roll to 0x28 again, and FIFO_DATA_OUT on the LPS22HH.
+fn fifo_first(fam: Int) -> Int
+    if fam == FAM_HH
+        return FIFO_OUT_HH
+    PRESS_OUT_XL
+
+// One FIFO sample's counts: the pressure, 24 bits signed, and the
+// temperature, 16 bits signed.
+@value
+struct FifoRaw
+    rp: Int
+    rt: Int
+
+// One sample of 5 bytes read as one burst from `first`, or `None` when the
+// part did not answer.
+fn fifo_sample<P: Lps22Port>(p: P, first: Int) -> ?FifoRaw [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(first, 5, var b)
+        return None
+    Some(FifoRaw { rp: dev_bus.dev_sign_extend((b[2] as Int << 16) | (b[1] as Int << 8) | b[0] as Int, 24),
+        rt: dev_bus.dev_sign_extend((b[4] as Int << 8) | b[3] as Int, 16) })
+
+// `Barometer.baro_fifo_count`: the number of samples in the FIFO, and 0 when
+// the part did not answer or the family is not known.
+pub fn baro_fifo_count_of<P: Lps22Port>(p: P) -> Int [hw]
+    let n = fifo_level(p)
+    if n < 0
+        return 0
+    n
+
+// `Barometer.baro_fifo_read`: up to 32 pressures out of the FIFO, oldest
+// first, each rounded to a pascal, in `dst`, which is emptied first.  Answers
+// how many it moved: 0 for an empty FIFO, and for a part that did not answer
+// the samples moved before it stopped.  The temperatures are `fifo_take`'s.
+pub fn baro_fifo_read_of<P: Lps22Port>(p: P, var dst: Vec[Pascals; 32]) -> Int [hw]
+    dst.clear()
+    let n = fifo_level(p)
+    if n < 0
+        return 0
+    let first = fifo_first(p.family())
+    var taken = 0
+    for _i in 0..n
+        if taken >= 32
+            break
+        let Some(s) = fifo_sample(p, first) else return taken
+        let _ = dst.push(Pascals { pa: pressure_pa(s.rp) })
         taken = taken + 1
     taken
 
@@ -1007,6 +1087,10 @@ pub fn start<P: Lps22Port>(p: P) -> Bool [hw]
     autoinc_set(p, true) and bdu_set(p, true) and odr_set(p, 0) and irq_pad_set(p, false, false) and drdy_irq(p, true)
 
 // ── The awaitable data-ready line ────────────────────────────────────
+
+// Stays a package function (planning page 3.5, the AsyncDeviceReady row):
+// no board's `BoardGpio` implements `AsyncEdge`, so a board driver cannot
+// implement `AsyncDeviceReady`.
 
 // Arms the INT_DRDY line on a pin-edge source: the Future `f` resolves
 // with the level captured when the line rises, which is when a
@@ -1110,18 +1194,6 @@ impl Lps22
     fn set_fifo(self, mode: Int, watermark: Int) -> Bool [hw]
         fifo_set(self, mode, watermark)
 
-    // Takes the samples out of the FIFO.
-    fn fifo_drain(self, var press: Lps22Samples, var temp: Lps22Samples) -> Int [hw]
-        fifo_take(self, var press, var temp)
-
-    // Sets the pressure threshold in pascals; answers the pascals held.
-    fn set_threshold(self, pa: Int) -> Int [hw]
-        threshold_set(self, pa)
-
-    // Turns the threshold interrupt on, above and below, latched or not.
-    fn threshold_interrupt(self, high: Bool, low: Bool, latched: Bool) -> Bool [hw]
-        threshold_irq(self, high, low, latched)
-
     // INT_SOURCE; reading it clears a latched event.
     fn interrupt_source(self) -> Int [hw]
         int_source(self)
@@ -1140,6 +1212,22 @@ impl Barometer[hw] for Lps22
     // The latest pressure, rounded to a pascal.
     fn baro_read(self) -> ?Pascals [hw]
         baro_read_of(self)
+
+    // The number of samples in the FIFO, 0 when the part did not answer.
+    fn baro_fifo_count(self) -> Int [hw]
+        baro_fifo_count_of(self)
+
+    // Up to 32 pressures out of the FIFO, oldest first, in pascals.
+    fn baro_fifo_read(self, var dst: Vec[Pascals; 32]) -> Int [hw]
+        baro_fifo_read_of(self, var dst)
+
+    // REF_P, on the LPS22HB.
+    fn baro_set_reference(self, p: Pascals) -> Bool [hw]
+        baro_set_reference_of(self, p)
+
+    // THS_P with PHE and PLE, not latched.
+    fn baro_set_threshold(self, p: Pascals, on_high: Bool, on_low: Bool) -> Bool [hw]
+        baro_set_threshold_of(self, p, on_high, on_low)
 
 impl Thermometer[hw] for Lps22
     // The same conversion as `baro_start`: one conversion gives both.
@@ -1234,18 +1322,6 @@ impl Lps22Spi
     fn set_fifo(self, mode: Int, watermark: Int) -> Bool [hw]
         fifo_set(self, mode, watermark)
 
-    // Takes the samples out of the FIFO.
-    fn fifo_drain(self, var press: Lps22Samples, var temp: Lps22Samples) -> Int [hw]
-        fifo_take(self, var press, var temp)
-
-    // Sets the pressure threshold in pascals; answers the pascals held.
-    fn set_threshold(self, pa: Int) -> Int [hw]
-        threshold_set(self, pa)
-
-    // Turns the threshold interrupt on, above and below, latched or not.
-    fn threshold_interrupt(self, high: Bool, low: Bool, latched: Bool) -> Bool [hw]
-        threshold_irq(self, high, low, latched)
-
     // INT_SOURCE; reading it clears a latched event.
     fn interrupt_source(self) -> Int [hw]
         int_source(self)
@@ -1263,6 +1339,22 @@ impl Barometer[hw] for Lps22Spi
     fn baro_read(self) -> ?Pascals [hw]
         baro_read_of(self)
 
+    // The number of samples in the FIFO, 0 when the part did not answer.
+    fn baro_fifo_count(self) -> Int [hw]
+        baro_fifo_count_of(self)
+
+    // Up to 32 pressures out of the FIFO, oldest first, in pascals.
+    fn baro_fifo_read(self, var dst: Vec[Pascals; 32]) -> Int [hw]
+        baro_fifo_read_of(self, var dst)
+
+    // REF_P, on the LPS22HB.
+    fn baro_set_reference(self, p: Pascals) -> Bool [hw]
+        baro_set_reference_of(self, p)
+
+    // THS_P with PHE and PLE, not latched.
+    fn baro_set_threshold(self, p: Pascals, on_high: Bool, on_low: Bool) -> Bool [hw]
+        baro_set_threshold_of(self, p, on_high, on_low)
+
 impl Thermometer[hw] for Lps22Spi
     // The same conversion as `baro_start`.
     fn temp_start(self) -> Int [hw]
@@ -1279,6 +1371,10 @@ impl Identifiable[hw] for Lps22Spi
 
 // ── The host scheduler's async form ──────────────────────────────────
 
+// Stays as it is (planning page 3.5, the `*Async` row): an `async fn` takes
+// no `@value` struct and the embedded tier refuses it, so this is a plain
+// struct with an `@tier(app)` impl.
+//
 // A part on the host scheduler, which implements `BarometerAsync` and
 // `ThermometerAsync`: a measurement starts a one-shot conversion, parks
 // the task for the time `conversion_us` gives, then until ONE_SHOT has

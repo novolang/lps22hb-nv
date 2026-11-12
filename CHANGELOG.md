@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `fifo_drain`, `set_threshold` and `threshold_interrupt` on `Lps22` and
+  `Lps22Spi` are gone.  `Barometer.baro_fifo_count` and `baro_fifo_read`
+  replace the drain, with the pressures as pascals in a `Vec[Pascals; 32]`;
+  `baro_set_threshold` replaces the other two, and sets the threshold and the
+  PHE and PLE events together, without a latch.  `fifo_take`, `threshold_set`
+  and `threshold_irq` stay for the temperatures, the millipascals and the latch.
+- `Barometer.baro_set_reference` writes REF_P on the LPS22HB, in counts of
+  1/4096 hPa, and answers `false` on the LPS22HH, whose scale is not known.
+- `baro_set_threshold` refuses a negative pressure and one past the
+  register, where `threshold_set` held it to the register's top.
+
 ## 0.1.0
 
 The first release: a driver for ST's LPS22HB and LPS22HH absolute pressure
