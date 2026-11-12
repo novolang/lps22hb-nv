@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
-are path dependencies until they are published.
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0. The release depends on both.
 
 - `fifo_drain`, `set_threshold` and `threshold_interrupt` on `Lps22` and
   `Lps22Spi` are gone.  `Barometer.baro_fifo_count` and `baro_fifo_read`
